@@ -58,6 +58,10 @@ from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 
 from . import int_field_for_border as iffb
+# from . import modern_int_field_for_border as mffb
+# from . import parallel_int_field_for_border as iffb
+
+# from line_profiler import profile
 
 
 na = lambda x:np.array([x])
@@ -262,7 +266,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             rho = self.rho
         self._solve_core(self, rho)
 
-
+    # @profile
     def gather(self, x_mp, y_mp):
 
         if not (len(x_mp)==len(y_mp)):
@@ -272,6 +276,11 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             ## compute beam electric field
             Ex_sc_n, Ey_sc_n = iffb.int_field_border(x_mp,y_mp,self.bias_x,self.bias_y,self.Dh,
                                          self.Dh, self.efx, self.efy, self.flag_inside_n_mat)
+            # DEx_sc_n, DEy_sc_n = mffb.int_field_border(x_mp,y_mp,self.bias_x,self.bias_y,self.Dh,
+            #                              self.Dh, self.efx, self.efy, self.flag_inside_n_mat)
+            
+            # np.testing.assert_allclose(DEx_sc_n, Ex_sc_n, rtol=1e-7)
+            # np.testing.assert_allclose(DEy_sc_n, Ey_sc_n, rtol=1e-7)
 
         else:
             Ex_sc_n=0.

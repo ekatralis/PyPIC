@@ -53,6 +53,9 @@
 import numpy as np
 from . import rhocompute as rhocom
 from . import int_field_for as iff
+# from . import parallel_int_field_for as iff
+# from . import modern_int_field as mff
+# from line_profiler import profile
 #~ from abc import abstractmethod, ABCMeta
 
 na = lambda x:np.array([x])
@@ -148,7 +151,7 @@ class PyPIC_Scatter_Gather(object):
         else:
             self.rho=charge*rho/(self.dx*self.dy);
 
-         
+    # @profile     
     def gather(self, x_mp, y_mp):
         
         if not (len(x_mp)==len(y_mp)):
@@ -158,7 +161,10 @@ class PyPIC_Scatter_Gather(object):
             ## compute beam electric field
             Ex_sc_n, Ey_sc_n = iff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
                                          self.dy, self.efx, self.efy)
-                       
+            # DEx_sc_n, DEy_sc_n = mff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+            #                              self.dy, self.efx, self.efy) 
+            # np.testing.assert_allclose(DEx_sc_n, Ex_sc_n, rtol=1e-7)
+            # np.testing.assert_allclose(DEy_sc_n, Ey_sc_n, rtol=1e-7)
         else:
             Ex_sc_n=0.
             Ey_sc_n=0.

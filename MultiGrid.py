@@ -5,6 +5,7 @@ from . import simple_polygon as spoly
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 # from line_profiler import profile
+# import matplotlib.pyplot as plt
 
 qe = e
 eps0 = epsilon_0
@@ -22,6 +23,20 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
             #check if the internal grid lies inside the chamber
             x_border = self.pic_internal.xn[self.pic_internal.flag_border_n]
             y_border = self.pic_internal.yn[self.pic_internal.flag_border_n]
+            # plt.figure(figsize=(8, 6))
+            # # plt.plot(x_border, x_border, 'bo-', label='Chamber Vertices')
+            # plt.plot(x_border, x_border, 'r.', label='Border vertices')
+            # plt.plot(pic_external.chamb.Vx, pic_external.chamb.Vy, 'ko-', label='Chamber')
+            # # plt.plot(self.pic_internal.xn, self.pic_internal.yn, 'b.', label='Chamber Vertices')
+            # plt.title("Chamber Outline from Vertices")
+            # plt.xlabel("X")
+            # plt.ylabel("Y")
+            # plt.axis('equal')
+            # plt.grid(True)
+            # plt.legend()
+            # print(dir(pic_external.chamb))
+            # print(pic_external.chamb.__class__)
+            # plt.show()
             if pic_external.chamb.is_outside(x_border, y_border).any() == True:
                 raise ValueError('The internal grid is outside the chamber!')
 
@@ -56,7 +71,7 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
                            y_mp < self.y_max_internal - self.D_discard))
                            
         # mask_external = np.logical_not(mask_internal)
-        idx_internal = np.where(mask_internal)[0]
+        idx_internal = np.where(mask_internal)[0] #consider switching to nonzero
         idx_external = np.where(~mask_internal)[0]
         # idx_internal = np.flatnonzero(mask_internal)
         # idx_external = np.flatnonzero(~mask_internal)
