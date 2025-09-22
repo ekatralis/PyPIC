@@ -1,0 +1,119 @@
+cuda_src = r'''
+#include <math.h>
+
+extern "C" __global__
+void int_field(const long N_mp,
+               const double* __restrict__ xn,
+               const double* __restrict__ yn,
+               const double bias_x,
+               const double bias_y,
+               const double dx,
+               const double dy,
+               const double* __restrict__ efx,
+               const double* __restrict__ efy,
+               const int Nxg,
+               const int Nyg,
+               const long stride_i,   // stride (in elements) along axis-0 (i)
+               const long stride_j,   // stride (in elements) along axis-1 (j)
+               double* __restrict__ Ex_n,
+               double* __restrict__ Ey_n)
+{
+    long p = blockDim.x * blockIdx.x + threadIdx.x;
+    if (p >= N_mp) return;
+
+    // Fortran-style indexing math (grid is 1-based logically)
+    double fi = 1.0 + (xn[p] - bias_x) / dx;
+    double fj = 1.0 + (yn[p] - bias_y) / dy;
+
+    int i = (int)floor(fi);
+    int j = (int)floor(fj);
+
+    double hx = fi - (double)i;
+    double hy = fj - (double)j;
+
+    double Ex = 0.0;
+    double Ey = 0.0;
+
+    // Valid cell interior: 1 <= i < Nxg and 1 <= j < Nyg
+    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
+        // convert to 0-based for memory addressing
+        int i0 = i - 1;
+        int j0 = j - 1;
+
+        long idx00 = (long)i0 * stride_i + (long)j0 * stride_j;       // (i,   j)
+        long idx10 = (long)(i0+1) * stride_i + (long)j0 * stride_j;   // (i+1, j)
+        long idx01 = (long)i0 * stride_i + (long)(j0+1) * stride_j;   // (i,   j+1)
+        long idx11 = (long)(i0+1) * stride_i + (long)(j0+1) * stride_j; // (i+1, j+1)
+
+        double w00 = (1.0 - hx) * (1.0 - hy);
+        double w10 = hx * (1.0 - hy);
+        double w01 = (1.0 - hx) * hy;
+        double w11 = hx * hy;
+
+        Ex = efx[idx00]*w00 + efx[idx10]*w10 + efx[idx01]*w01 + efx[idx11]*w11;
+        Ey = efy[idx00]*w00 + efy[idx10]*w10 + efy[idx01]*w01 + efy[idx11]*w11;
+    }
+
+    // (Outside cells remain zero, matching the Fortran 'no assignment' behavior.)
+    Ex_n[p] = Ex;
+    Ey_n[p] = Ey;
+}
+'''
+
+mod = cp.RawModule(code=cuda_src, options=('-std=c++11',), name_expressions=('int_field',))
+int_field_kernel = mod.get_function('int_field')
+
+def _strides_in_elements(arr2d):
+    return (arr2d.strides[0] // arr2d.itemsize,
+            arr2d.strides[1] // arr2d.itemsize)
+
+@profile
+def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, stream=None):
+    """
+    CuPy wrapper for the int_field kernel.
+
+    Parameters
+    ----------
+    xn, yn : (N_mp,) cupy.ndarray, float64
+    bias_x, bias_y, dx, dy : float (or float64)
+    efx, efy : (Nxg, Nyg) cupy.ndarray, float64      # matches Fortran shapes
+    stream : cp.cuda.Stream or None
+
+    Returns
+    -------
+    Ex_n, Ey_n : (N_mp,) cupy.ndarray, float64
+    """
+    # Type/shape checks (lightweight)
+    # assert xn.dtype == yn.dtype == cp.float64
+    # assert efx.dtype == efy.dtype == cp.float64
+    # assert efx.shape == efy.shape and efx.ndim == 2
+
+    Nxg, Nyg = map(int, efx.shape)  # shape is (Nxg, Nyg) to mirror Fortran
+    N_mp = int(xn.size)
+
+    Ex_n = cp.zeros_like(xn)
+    Ey_n = cp.zeros_like(xn)
+
+    stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
+
+    threads = 256
+    blocks = (N_mp + threads - 1) // threads
+
+    args = (
+        N_mp,
+        xn, yn,
+        float(bias_x), float(bias_y),
+        float(dx), float(dy),
+        efx, efy,
+        cp.int32(Nxg), cp.int32(Nyg),
+        cp.int64(stride_i), cp.int64(stride_j),
+        Ex_n, Ey_n
+    )
+
+    if stream is None:
+        int_field_kernel((blocks,), (threads,), args)
+    else:
+        with stream:
+            int_field_kernel((blocks,), (threads,), args)
+
+    return Ex_n, Ey_n
