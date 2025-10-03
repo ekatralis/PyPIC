@@ -4,6 +4,23 @@ from . import FiniteDifferences_ShortleyWeller_SquareGrid as PIC_FDSW
 from . import simple_polygon as spoly
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
+# from concurrent.futures import ThreadPoolExecutor
+# from line_profiler import profile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def _slice_and_gather(pic, x_mp, y_mp, mask):
+    """
+    Compute indices (flatnonzero) and run pic.gather on that slice.
+    Returns (idx, Ex_part, Ey_part).
+    """
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        # Return empty parts to keep logic simple
+        return idx, np.empty((0,), dtype=float), np.empty((0,), dtype=float)
+    Ex_part, Ey_part = pic.gather(x_mp[idx], y_mp[idx])
+    return idx, Ex_part, Ey_part
+
 
 qe = e
 eps0 = epsilon_0
@@ -41,11 +58,13 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
         self.Dh_internal = Dh_internal
         self.N_nodes_discard = N_nodes_discard
         self.D_discard = N_nodes_discard*Dh_internal	
+        self._pool = ThreadPoolExecutor(max_workers=2)
 
     def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
         self.pic_external.scatter(x_mp, y_mp, nel_mp, charge, flag_add)
         self.pic_internal.scatter(x_mp, y_mp, nel_mp, charge, flag_add)
-
+        
+    # @profile
     def gather(self, x_mp, y_mp):
         mask_internal = np.logical_and(\
             np.logical_and(x_mp > self.x_min_internal + self.D_discard, 
@@ -53,21 +72,57 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
             np.logical_and(y_mp > self.y_min_internal + self.D_discard, 
                            y_mp < self.y_max_internal - self.D_discard))
                            
-        idx_internal = np.flatnonzero(mask_internal)
-        idx_external = np.flatnonzero(~mask_internal)
+        # idx_internal = np.flatnonzero(mask_internal)
+        # idx_external = np.flatnonzero(~mask_internal)
 
-        Ex_sc_n_external, Ey_sc_n_external = self.pic_external.gather(x_mp[idx_external], y_mp[idx_external])
-        Ex_sc_n_internal, Ey_sc_n_internal = self.pic_internal.gather(x_mp[idx_internal], y_mp[idx_internal])
+        mask_external = ~mask_internal
+
+        # Submit ONE future per side; each future computes its own flatnonzero + gather
+        fut_ext = self._pool.submit(_slice_and_gather, self.pic_external, x_mp, y_mp, mask_external)
+        fut_int = self._pool.submit(_slice_and_gather, self.pic_internal, x_mp, y_mp, mask_internal)
+
+        Ex = np.zeros_like(x_mp, dtype=float)
+        Ey = np.zeros_like(y_mp, dtype=float)
+
+        for fut in as_completed([fut_ext, fut_int]):
+            idx, Ex_part, Ey_part = fut.result()
+            if idx.size:
+                Ex[idx] = Ex_part
+                Ey[idx] = Ey_part
+
+        return Ex, Ey
+        # idx_ext = np.flatnonzero(mask_internal)
+        # idx_int = np.flatnonzero(~mask_internal)
         
-        Ex_sc_n = np.zeros_like(x_mp)
-        Ey_sc_n = np.zeros_like(x_mp)
+
+        # with ThreadPoolExecutor(max_workers=2) as pool:
+        #     futs = {
+        #         pool.submit(self.pic_external.gather, x_mp[idx_ext], y_mp[idx_ext]): ("ext", idx_ext),
+        #         pool.submit(self.pic_internal.gather, x_mp[idx_int], y_mp[idx_int]): ("int", idx_int),
+        #     }
+        #     Ex = np.zeros_like(x_mp); Ey = np.zeros_like(y_mp)
+        #     for fut in as_completed(futs):              # handle whichever completes first
+        #         _, idx = futs[fut]
+        #         Ex_part, Ey_part = fut.result()
+        #         Ex[idx] = Ex_part; Ey[idx] = Ey_part
+        #     return Ex, Ey
+        # Ex_sc_n_external, Ey_sc_n_external = self.pic_external.gather(x_mp[idx_external], y_mp[idx_external])
+        # Ex_sc_n_internal, Ey_sc_n_internal = self.pic_internal.gather(x_mp[idx_internal], y_mp[idx_internal])
+        # with ThreadPoolExecutor(max_workers=2) as pool:
+            # future_ext = pool.submit(self.pic_external.gather,x_mp[idx_external], y_mp[idx_external])
+            # future_int = pool.submit(self.pic_internal.gather,x_mp[idx_internal], y_mp[idx_internal])
         
-        Ex_sc_n[idx_external] = Ex_sc_n_external
-        Ey_sc_n[idx_external] = Ey_sc_n_external
-        Ex_sc_n[idx_internal] = Ex_sc_n_internal
-        Ey_sc_n[idx_internal] = Ey_sc_n_internal
+        # Ex_sc_n_external, Ey_sc_n_external = future_ext.result()
+        # Ex_sc_n_internal, Ey_sc_n_internal = future_int.result()
+        # Ex_sc_n = np.zeros_like(x_mp)
+        # Ey_sc_n = np.zeros_like(x_mp)
         
-        return Ex_sc_n, Ey_sc_n
+        # Ex_sc_n[idx_external] = Ex_sc_n_external
+        # Ey_sc_n[idx_external] = Ey_sc_n_external
+        # Ex_sc_n[idx_internal] = Ex_sc_n_internal
+        # Ey_sc_n[idx_internal] = Ey_sc_n_internal
+        
+        # return Ex_sc_n, Ey_sc_n
         
     def gather_phi(self, x_mp, y_mp):
         mask_internal = np.logical_and(\
