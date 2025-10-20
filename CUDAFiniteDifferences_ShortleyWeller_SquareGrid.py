@@ -52,20 +52,26 @@
 
 import numpy as np
 import scipy.sparse as scsp
-from scipy.sparse.linalg import spsolve
-import scipy.sparse.linalg as ssl
+# from scipy.sparse.linalg import spsolve
+# import scipy.sparse.linalg as ssl
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 import cupy as cp
+from cupyx.scipy.sparse import csc_matrix, csr_matrix
+from cupyx.scipy.sparse.linalg import splu, spsolve
+from cupyx.scipy.linalg import lu_factor, lu_solve
+from cupyx.scipy.sparse.linalg import cg, gmres, LinearOperator
 from line_profiler import profile
-
-from . import int_field_for_border as iffb
+from tqdm import tqdm
+from cupy import fuse
+from cupyx.time import repeat
+# from . import int_field_for_border as iffb
 
 
 na = lambda x:np.array([x])
 
-qe = e
-eps0 = epsilon_0
+qe = cp.array(e)
+eps0 = cp.array(epsilon_0)
 
 cuda_src = r'''
 extern "C" __global__
@@ -222,12 +228,130 @@ def int_field_border_cu(xn, yn, bias_x, bias_y, dx, dy,
         with stream:
             int_field_kernel((blocks,), (threads,), args)
 
-    return Ex_n, Ey_n
+    # return Ex_n, Ey_n
 
+kernel_code_f = r'''
+extern "C" {
+
+#if __CUDA_ARCH__ < 600 && defined(__CUDA_ARCH__)
+__device__ double atomicAdd_double(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#define ATOMIC_ADD(addr, v) atomicAdd_double((addr), (v))
+#else
+#define ATOMIC_ADD(addr, v) atomicAdd((addr), (v))
+#endif
+
+// Drop-in: matches Fortran INT/1-based logic and (i,j) indexing
+__global__ void compute_sc_rho_kernel_f(
+    const long long N_mp,
+    const double* __restrict__ x_mp,
+    const double* __restrict__ y_mp,
+    const double* __restrict__ nel_mp,
+    const double bias_x, const double bias_y,
+    const double dx, const double dy,
+    const int Nxg, const int Nyg,
+    double* __restrict__ rho,
+    const long long sx,  // stride (elements) for dim-0 (i)
+    const long long sy   // stride (elements) for dim-1 (j)
+){
+    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= N_mp) return;
+
+    double x = x_mp[p];
+    double y = y_mp[p];
+    double w = nel_mp[p];
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(w)) return;
+    if (!(dx > 0.0) || !(dy > 0.0)) return;
+
+    // Fortran-style: 1-based indices via INT (truncate toward zero)
+    double fi = 1.0 + (x - bias_x) / dx;
+    int i = (int)(fi);         // INT in Fortran (trunc toward zero)
+    double hx = fi - (double)i;
+
+    double fj = 1.0 + (y - bias_y) / dy;
+    int j = (int)(fj);
+    double hy = fj - (double)j;
+
+    // Fortran guard: if (i>0 .and. j>0 .and. i<Nxg .and. j<Nyg)
+    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
+        // Convert to 0-based offsets
+        long long i0 = (long long)(i - 1);
+        long long j0 = (long long)(j - 1);
+
+        long long idx00 = i0 * sx + j0 * sy;
+
+        double w00 = w * (1.0 - hx) * (1.0 - hy);
+        double w10 = w * (      hx) * (1.0 - hy);
+        double w01 = w * (1.0 - hx) * (      hy);
+        double w11 = w * (      hx) * (      hy);
+
+        ATOMIC_ADD(&rho[idx00             ], w00);
+        ATOMIC_ADD(&rho[idx00 + sx        ], w10);
+        ATOMIC_ADD(&rho[idx00 + sy        ], w01);
+        ATOMIC_ADD(&rho[idx00 + sx + sy   ], w11);
+    }
+}
+} // extern "C"
+'''
+mod = cp.RawModule(code=kernel_code_f,
+                   options=('-std=c++14','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
+
+@profile
+def compute_rho_gpu_dropin(
+    x_mp, y_mp, nel_mp,
+    bias_x, bias_y, dx, dy,
+    Nxg, Nyg,
+    rho=None
+):
+    # Device arrays, float64
+    # x_mp = cp.asarray(x_mp, dtype=cp.float64)
+    # y_mp = cp.asarray(y_mp, dtype=cp.float64)
+    # nel_mp = cp.asarray(nel_mp, dtype=cp.float64)
+
+    # rho shaped (Nxg, Nyg) like Fortran; default Fortran-order
+    # if rho is None:
+    #     rho = cp.zeros((Nxg, Nyg), dtype=cp.float64, order='F')
+    # else:
+    #     assert isinstance(rho, cp.ndarray)
+    #     assert rho.dtype == cp.float64
+    #     assert rho.shape == (Nxg, Nyg)
+    #     rho.fill(0.0)
+
+    # Strides in ELEMENTS (not bytes)
+    sx = rho.strides[0] // rho.itemsize
+    sy = rho.strides[1] // rho.itemsize
+
+    N_mp = int(x_mp.size)
+    threads = 512
+    blocks = (N_mp + threads - 1) // threads
+
+    compute_sc_rho_kernel_f(
+        (blocks,), (threads,),
+        (
+            cp.int64(N_mp),
+            x_mp, y_mp, nel_mp,
+            float(bias_x), float(bias_y),
+            float(dx), float(dy),
+            cp.int32(Nxg), cp.int32(Nyg),
+            rho,
+            cp.int64(sx), cp.int64(sy)
+        )
+    )
+    # return rho
 
 class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
-    #@profile
-    def __init__(self,chamb, Dh, sparse_solver = 'scipy_slu', tol_stem = 0.01, tol_der = 0.1, include_solver=True):
+    @profile
+    def __init__(self,chamb, Dh, sparse_solver = 'cupy_splu', tol_stem = 0.01, tol_der = 0.1, include_solver=True):
 
         print('Start PIC init.:')
         print('Finite Differences, Shortley-Weller, Square Grid')
@@ -264,9 +388,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             list_internal_force_zero = []
             # Build A Dx Dy matrices 
-            for u in range(0,Nxg*Nyg):
-                if np.mod(u, Nxg*Nyg//20)==0:
-                    print(('Mat. assembly %.0f'%(float(u)/ float(Nxg*Nyg)*100)+"""%"""))
+            for u in tqdm(range(0,Nxg*Nyg), desc="Mat Assembly"):
                 if flag_inside_n[u]:
 
                     #Compute Shortley-Weller coefficients
@@ -369,29 +491,32 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             Asel = Msel.T*A*Msel
             Asel=Asel.tocsc()
-            # print('Asel shape:', Asel.shape)
 
 
             self.xn = xn
             self.yn = yn
 
-            self.flag_inside_n = flag_inside_n
-            self.flag_outside_n = flag_outside_n
-            self.flag_outside_n_mat = flag_outside_n_mat
-            self.flag_force_zero = flag_force_zero
-            self.Asel = Asel
+            self.flag_inside_n = cp.array(flag_inside_n)
+            self.flag_outside_n = cp.array(flag_outside_n)
+            self.flag_outside_n_mat = cp.array(flag_outside_n_mat)
+            self.flag_force_zero = cp.array(flag_force_zero)
+            self.Asel = csc_matrix(Asel)
+            self.Acsr = csr_matrix(Asel)
 
-            self.Dx = Dx.tocsc()
+            self.Dx = csc_matrix(Dx)
 
-            self.Dy = Dy.tocsc()
+            self.Dy = csc_matrix(Dy)
 
             self.sparse_solver = sparse_solver
+
+            if self.sparse_solver == 'cupy_custom': 
+                self.A = csc_matrix(A)
 
             self.U_sc_eV_stp=0.;
 
 
-            self.Msel = Msel.tocsc()
-            self.Msel_T = (Msel.T).tocsc()
+            self.Msel = csc_matrix(Msel)
+            self.Msel_T = csc_matrix(Msel.T)
 
             #initialize self.luobj
             self.build_sparse_solver()
@@ -409,12 +534,12 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.tol_stem = None
             self.tol_der = None
 
-        self.flag_inside_n_mat = np.logical_not(flag_outside_n_mat)
+        self.flag_inside_n_mat = cp.logical_not(self.flag_outside_n_mat).astype(cp.uint8, copy=False)
         self.chamb = chamb
-        self.rho = np.zeros((self.Nxg,self.Nyg));
-        self.phi = np.zeros((self.Nxg,self.Nyg));
-        self.efx = np.zeros((self.Nxg,self.Nyg));
-        self.efy = np.zeros((self.Nxg,self.Nyg));
+        self.rho = cp.zeros((self.Nxg,self.Nyg));
+        self.phi = cp.zeros((self.Nxg,self.Nyg));
+        self.efx = cp.zeros((self.Nxg,self.Nyg));
+        self.efy = cp.zeros((self.Nxg,self.Nyg));
 
     #@profile    
     def solve(self, rho = None, flag_verbose = False):
@@ -431,45 +556,45 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
         if len(x_mp)>0:
             ## compute beam electric field
-            nar = lambda x: cp.asnumpy(x)
-            car = lambda x: cp.asarray(x)
-
-            x_mp_gpu = car(x_mp)
-            y_mp_gpu = car(y_mp)
-            efx = car(self.efx)
-            efy = car(self.efy)
-            Exn = cp.zeros_like(x_mp_gpu)
-            Eyn = cp.zeros_like(x_mp_gpu)
-            inside_mat_GPU = car(self.flag_inside_n_mat)
-            inside_mat_GPU = inside_mat_GPU.astype(cp.uint8, copy=False)
-
-            Ex_sc_n, Ey_sc_n = iffb.int_field_border(x_mp,y_mp,self.bias_x,self.bias_y,self.Dh,
-                                         self.Dh, self.efx, self.efy, self.flag_inside_n_mat)
+            Ex_sc_n = cp.empty_like(x_mp)
+            Ey_sc_n = cp.empty_like(x_mp)
             
-            Ex_sc_n_gpu, Ey_sc_n_gpu = int_field_border_cu(x_mp_gpu,y_mp_gpu,self.bias_x,self.bias_y,self.dx,
-                                         self.dy, efx, efy, inside_mat_GPU, Ex_n=Exn, Ey_n=Eyn)
-            np.testing.assert_allclose(Ex_sc_n,nar(Ex_sc_n_gpu),atol=1e-7,rtol = 1e-4)
-            np.testing.assert_allclose(Ey_sc_n,nar(Ey_sc_n_gpu),atol=1e-7,rtol = 1e-4)
+            int_field_border_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+                                self.dy, self.efx, self.efy, self.flag_inside_n_mat, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
         else:
             Ex_sc_n=0.
             Ey_sc_n=0.
 
         return Ex_sc_n, Ey_sc_n
+    
+    @profile
+    def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
+        
+        if not (len(x_mp)==len(y_mp)==len(nel_mp)):
+            raise ValueError('x_mp, y_mp, nel_mp should have the same length!!!')
+        
+        if len(x_mp)>0:
+            rho = cp.empty((self.Nxg, self.Nyg), dtype=cp.float64)
+            compute_rho_gpu_dropin(x_mp,y_mp,nel_mp,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho)
+        else:
+            rho=self.rho*0.
+
+        denom = cp.array(self.dx*self.dy)
+        if flag_add:
+            self.rho+=charge*rho/denom;
+        else:
+            self.rho=charge*rho/denom;
 
     def build_sparse_solver(self):
 
-        if self.sparse_solver == 'scipy_slu':
-            print("Using scipy superlu solver...")
-            luobj = ssl.splu(self.Asel.tocsc())
-        elif self.sparse_solver == 'PyKLU':
-            print("Using klu solver...")
-            try:
-                import PyKLU.klu as klu
-                luobj = klu.Klu(self.Asel.tocsc())
-            except Exception as e:
-                print("Got exception: ", e)
-                print("Falling back on scipy superlu solver:")
-                luobj = ssl.splu(self.Asel.tocsc())
+        if self.sparse_solver == 'cupy_splu':
+            print("[Solver INIT]: Using CuPy splu solver")
+            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
+        elif self.sparse_solver == 'cupy_custom':
+            print("[Solver INIT]: Using CuPy no selection")
+            # luobj = None
+            luobj = splu(self.A, permc_spec="MMD_AT_PLUS_A")
+            self._solve_core = self._solve_core_iter
         else:
             raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
 
@@ -495,20 +620,36 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             state = states[ii]
             self._solve_core(state, state.rho)
 
-
+    @profile
     def _solve_core(self, state, rho):
 
         b=-rho.flatten()/eps0;
         b[(self.flag_force_zero)]=0;
-        b_sel = self.Msel_T*b
+        b_sel = self.Msel_T@b
         phi_sel = self.luobj.solve(b_sel)
-        phi = self.Msel*phi_sel
+        phi = self.Msel@phi_sel
 
-        efx = self.Dx*phi
-        efy = self.Dy*phi
-        phi=np.reshape(phi,(self.Nxg,self.Nyg))
-        efx=np.reshape(efx,(self.Nxg,self.Nyg))
-        efy=np.reshape(efy,(self.Nxg,self.Nyg))
+        efx = self.Dx@phi
+        efy = self.Dy@phi
+        phi=cp.reshape(phi,(self.Nxg,self.Nyg))
+        efx=cp.reshape(efx,(self.Nxg,self.Nyg))
+        efy=cp.reshape(efy,(self.Nxg,self.Nyg))
+        state.efx = efx
+        state.efy = efy
+        state.phi = phi
+    
+    @profile
+    def _solve_core_iter(self, state, rho):
+        
+        b=-rho.flatten()/eps0;
+        b[(self.flag_force_zero)]=0;
+        phi = self.luobj.solve(b)
+
+        efx = self.Dx@phi
+        efy = self.Dy@phi
+        phi=cp.reshape(phi,(self.Nxg,self.Nyg))
+        efx=cp.reshape(efx,(self.Nxg,self.Nyg))
+        efy=cp.reshape(efy,(self.Nxg,self.Nyg))
         state.efx = efx
         state.efy = efy
         state.phi = phi

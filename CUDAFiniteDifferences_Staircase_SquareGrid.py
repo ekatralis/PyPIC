@@ -52,19 +52,133 @@
 
 import numpy as np
 import scipy.sparse as scsp
-from scipy.sparse.linalg import spsolve
 import scipy.sparse.linalg as ssl
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
+import cupy as cp
+from cupyx.scipy.sparse import csc_matrix, csr_matrix
+from cupyx.scipy.sparse.linalg import splu
+from line_profiler import profile
 
 na = lambda x:np.array([x])
 
-qe = e
-eps0 = epsilon_0
+qe = cp.array(e)
+eps0 = cp.array(epsilon_0)
+
+cuda_src = r'''
+extern "C" __global__
+void int_field(const long N_mp,
+               const double* __restrict__ xn,
+               const double* __restrict__ yn,
+               const double bias_x,
+               const double bias_y,
+               const double dx,
+               const double dy,
+               const double* __restrict__ efx,
+               const double* __restrict__ efy,
+               const int Nxg,
+               const int Nyg,
+               const long stride_i,
+               const long stride_j,
+               double* __restrict__ Ex_n,
+               double* __restrict__ Ey_n)
+{
+    long p = blockDim.x * blockIdx.x + threadIdx.x;
+    if (p >= N_mp) return;
+
+    double fi = 1.0 + (xn[p] - bias_x) / dx;
+    double fj = 1.0 + (yn[p] - bias_y) / dy;
+
+    // Match Fortran INT(): truncate toward zero
+    int i = (int)fi;
+    int j = (int)fj;
+
+    double hx = fi - (double)i;
+    double hy = fj - (double)j;
+
+    double Ex = 0.0, Ey = 0.0;
+    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
+        int i0 = i - 1, j0 = j - 1;
+
+        long idx00 = (long)i0 * stride_i + (long)j0 * stride_j;
+        long idx10 = (long)(i0+1) * stride_i + (long)j0 * stride_j;
+        long idx01 = (long)i0 * stride_i + (long)(j0+1) * stride_j;
+        long idx11 = (long)(i0+1) * stride_i + (long)(j0+1) * stride_j;
+
+        double w00 = (1.0 - hx) * (1.0 - hy);
+        double w10 = hx * (1.0 - hy);
+        double w01 = (1.0 - hx) * hy;
+        double w11 = hx * hy;
+
+        Ex = efx[idx00]*w00 + efx[idx10]*w10 + efx[idx01]*w01 + efx[idx11]*w11;
+        Ey = efy[idx00]*w00 + efy[idx10]*w10 + efy[idx01]*w01 + efy[idx11]*w11;
+    }
+    Ex_n[p] = Ex;
+    Ey_n[p] = Ey;
+}
+''';
+
+mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+int_field_kernel = mod.get_function('int_field')
+
+def _strides_in_elements(arr2d):
+    return (arr2d.strides[0] // arr2d.itemsize,
+            arr2d.strides[1] // arr2d.itemsize)
+
+@profile
+def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=None, stream=None):
+    """
+    CuPy wrapper for the int_field kernel.
+
+    Parameters
+    ----------
+    xn, yn : (N_mp,) cupy.ndarray, float64
+    bias_x, bias_y, dx, dy : float (or float64)
+    efx, efy : (Nxg, Nyg) cupy.ndarray, float64      # matches Fortran shapes
+    stream : cp.cuda.Stream or None
+
+    Returns
+    -------
+    Ex_n, Ey_n : (N_mp,) cupy.ndarray, float64
+    """
+    # Type/shape checks (lightweight)
+    # assert xn.dtype == yn.dtype == cp.float64
+    # assert efx.dtype == efy.dtype == cp.float64
+    # assert efx.shape == efy.shape and efx.ndim == 2
+
+    Nxg, Nyg = map(int, efx.shape)  # shape is (Nxg, Nyg) to mirror Fortran
+    N_mp = int(xn.size)
+
+    # Ex_n = cp.zeros_like(xn)
+    # Ey_n = cp.zeros_like(xn)
+
+    stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
+
+    threads = 512
+    blocks = (N_mp + threads - 1) // threads
+
+    args = (
+        N_mp,
+        xn, yn,
+        float(bias_x), float(bias_y),
+        float(dx), float(dy),
+        efx, efy,
+        cp.int32(Nxg), cp.int32(Nyg),
+        cp.int64(stride_i), cp.int64(stride_j),
+        Ex_n, Ey_n
+    )
+
+    if stream is None:
+        int_field_kernel((blocks,), (threads,), args)
+    else:
+        with stream:
+            int_field_kernel((blocks,), (threads,), args)
+
+    # return Ex_n, Ey_n
 
 class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
     #@profile
-    def __init__(self, chamb, Dh, sparse_solver = 'scipy_slu', remove_external_nodes_from_mat=True, include_solver = True):
+    def __init__(self, chamb, Dh, sparse_solver = 'cupy_splu', remove_external_nodes_from_mat=True, include_solver = True):
         
         print('Start PIC init.:')
         print('Finite Differences, Square Grid')
@@ -139,50 +253,41 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
                     Msel[ii, ii] =1.
             Msel = Msel.tocsc()
             Asel = Msel.T*A*Msel
-            Asel=Asel.tocsc() 
+            Asel = csc_matrix(Asel)
             # print('Asel shape:', Asel.shape)
 
-            if sparse_solver == 'scipy_slu':
+            if sparse_solver == 'cupy_splu':
                 print("Using scipy superlu solver...")
-                luobj = ssl.splu(Asel.tocsc())
-            elif sparse_solver == 'PyKLU':
-                print("Using klu solver...")
-                try:
-                    import PyKLU.klu as klu
-                    luobj = klu.Klu(Asel.tocsc())
-                except Exception as e: 
-                    print("Got exception: ", e)
-                    print("Falling back on scipy superlu solver:")
-                    luobj = ssl.splu(Asel.tocsc())
+                luobj = splu(Asel, permc_spec="MMD_AT_PLUS_A")
             else:
                 raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
                 
             self.xn = xn
             self.yn = yn
             
-            self.flag_inside_n = flag_inside_n
-            self.flag_outside_n = flag_outside_n
-            self.flag_outside_n_mat = flag_outside_n_mat
-            self.flag_inside_n_mat = np.logical_not(flag_outside_n_mat)
-            self.flag_border_mat = flag_border_mat
+            self.flag_inside_n = cp.array(flag_inside_n)
+            self.flag_outside_n = cp.array(flag_outside_n)
+            self.flag_outside_n_mat = cp.array(flag_outside_n_mat)
+            self.flag_inside_n_mat = cp.logical_not(self.flag_outside_n_mat)
+            self.flag_border_mat = cp.array(flag_border_mat)
             self.Asel = Asel
             self.luobj = luobj
             self.U_sc_eV_stp=0.;
             self.sparse_solver = sparse_solver
-            self.Msel = Msel.tocsc()
-            self.Msel_T = (Msel.T).tocsc()
-            self.flag_border_n = flag_border_n
+            self.Msel = csc_matrix(Msel)
+            self.Msel_T = csc_matrix(Msel.T)
+            self.flag_border_n = cp.array(flag_border_n)
             
             print('Done PIC init.')
             
         else:
             self.solve = self._solve_for_states          
 
-
-        self.rho = np.zeros((self.Nxg,self.Nyg));
-        self.phi = np.zeros((self.Nxg,self.Nyg));
-        self.efx = np.zeros((self.Nxg,self.Nyg));
-        self.efy = np.zeros((self.Nxg,self.Nyg));
+        self.Dhcp = cp.array(Dh)
+        self.rho = cp.zeros((self.Nxg,self.Nyg));
+        self.phi = cp.zeros((self.Nxg,self.Nyg));
+        self.efx = cp.zeros((self.Nxg,self.Nyg));
+        self.efy = cp.zeros((self.Nxg,self.Nyg));
         self.chamb = chamb
         
         
@@ -195,6 +300,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             
         self._solve_core(self, rho, pic_external) #change 2
 
+    
         
     def get_state_object(self):
         state = FiniteDifferences_Staircase_SquareGrid(chamb=self.chamb, Dh=self.Dh, include_solver=False)
@@ -222,11 +328,12 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             pic_external = pic_s_external[ii]
             self._solve_core(state, state.rho, pic_external)
                 
-                
+
+    @profile            
     def _solve_core(self, state, rho, pic_external):
 
         b=-rho.flatten()/eps0;
-        b[~(self.flag_inside_n)]=0.; #boundary condition
+        b[(self.flag_outside_n)]=0.; #boundary condition
 
         if pic_external is not None:
             x_border = self.xn[self.flag_border_n]
@@ -234,10 +341,10 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             phi_border = pic_external.gather_phi(x_border, y_border)
             b[self.flag_border_n] = phi_border
 
-        b_sel = self.Msel_T*b
+        b_sel = self.Msel_T@b
         phi_sel = self.luobj.solve(b_sel)
-        phi = self.Msel*phi_sel
-        phi=np.reshape(phi,(self.Nxg,self.Nyg))
+        phi = self.Msel@phi_sel
+        phi=cp.reshape(phi,(self.Nxg,self.Nyg))
 
         efx = state.efx
         efy = state.efy
@@ -247,9 +354,9 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
 
         efx[self.flag_border_mat]=efx[self.flag_border_mat]*2;
         efy[self.flag_border_mat]=efy[self.flag_border_mat]*2;
-        
-        state.efx = efx / (2*self.Dh);    #divide grid size
-        state.efy = efy / (2*self.Dh); 
+
+        state.efx = efx / (2*self.Dhcp);    #divide grid size
+        state.efy = efy / (2*self.Dhcp);
         state.rho = rho
         state.phi = phi
         state.b = b

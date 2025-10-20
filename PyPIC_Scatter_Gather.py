@@ -112,7 +112,7 @@ void int_field(const long N_mp,
 }
 ''';
 
-mod = cp.RawModule(code=cuda_src, options=('-std=c++11',))
+mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
 int_field_kernel = mod.get_function('int_field')
 
 def _strides_in_elements(arr2d):
@@ -148,7 +148,7 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
 
     stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
 
-    threads = 256
+    threads = 512
     blocks = (N_mp + threads - 1) // threads
 
     args = (
@@ -232,7 +232,7 @@ __global__ void compute_sc_rho_kernel(
 
 } // extern "C"
 '''
-mod = cp.RawModule(code=kernel_code, options=('-std=c++11',), name_expressions=['compute_sc_rho_kernel'])
+mod = cp.RawModule(code=kernel_code, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
 compute_sc_rho_kernel = mod.get_function('compute_sc_rho_kernel')
 
 @profile
@@ -338,8 +338,7 @@ __global__ void compute_sc_rho_kernel_f(
 } // extern "C"
 '''
 mod = cp.RawModule(code=kernel_code_f,
-                   options=('-std=c++14',),
-                   name_expressions=['compute_sc_rho_kernel_f'])
+                   options=('-std=c++14','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
 compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
 
 @profile
@@ -368,7 +367,7 @@ def compute_rho_gpu_dropin(
     sy = rho.strides[1] // rho.itemsize
 
     N_mp = int(x_mp.size)
-    threads = 256
+    threads = 512
     blocks = (N_mp + threads - 1) // threads
 
     compute_sc_rho_kernel_f(
