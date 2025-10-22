@@ -65,6 +65,7 @@ from line_profiler import profile
 from tqdm import tqdm
 from cupy import fuse
 from cupyx.time import repeat
+from .luLU import luLU
 # from . import int_field_for_border as iffb
 
 
@@ -595,6 +596,9 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             # luobj = None
             luobj = splu(self.A, permc_spec="MMD_AT_PLUS_A")
             self._solve_core = self._solve_core_iter
+        elif self.sparse_solver == 'luLU':
+            print("[Solver INIT]: Using luLU solver")
+            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
         else:
             raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
 
