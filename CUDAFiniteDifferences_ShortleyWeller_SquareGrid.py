@@ -66,6 +66,8 @@ from tqdm import tqdm
 from cupy import fuse
 from cupyx.time import repeat
 from .luLU import luLU
+from .cuDSSLU import SpMDVSolver
+from . import rhocompute as rhocom
 # from . import int_field_for_border as iffb
 
 
@@ -575,7 +577,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             raise ValueError('x_mp, y_mp, nel_mp should have the same length!!!')
         
         if len(x_mp)>0:
-            rho = cp.empty((self.Nxg, self.Nyg), dtype=cp.float64)
+            rho = cp.zeros((self.Nxg, self.Nyg), dtype=cp.float64)
             compute_rho_gpu_dropin(x_mp,y_mp,nel_mp,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho)
         else:
             rho=self.rho*0.
@@ -599,6 +601,9 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         elif self.sparse_solver == 'luLU':
             print("[Solver INIT]: Using luLU solver")
             luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
+        elif self.sparse_solver == 'cuDSS':
+            print("[Solver INIT]: Using cuDSS solver")
+            luobj = SpMDVSolver(self.Asel.tocsr())
         else:
             raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
 
