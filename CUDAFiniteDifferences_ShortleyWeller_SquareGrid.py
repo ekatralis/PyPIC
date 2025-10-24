@@ -66,7 +66,11 @@ from tqdm import tqdm
 from cupy import fuse
 from cupyx.time import repeat
 from .luLU import luLU
-from .cuDSSLU import SpMDVSolver
+try:
+    from .cuDSSLU import SpMDVSolver
+except ModuleNotFoundError:
+    import warnings
+    warnings.warn("nvmath package not found. cuDSS solver unavailable")
 from . import rhocompute as rhocom
 # from . import int_field_for_border as iffb
 
