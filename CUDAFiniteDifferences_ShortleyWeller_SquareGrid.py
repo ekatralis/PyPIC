@@ -80,6 +80,117 @@ na = lambda x:np.array([x])
 qe = cp.array(e)
 eps0 = cp.array(epsilon_0)
 
+cuda_src_nob = r'''
+extern "C" __global__
+void int_field(const long N_mp,
+               const double* __restrict__ xn,
+               const double* __restrict__ yn,
+               const double bias_x,
+               const double bias_y,
+               const double dx,
+               const double dy,
+               const double* __restrict__ efx,
+               const double* __restrict__ efy,
+               const int Nxg,
+               const int Nyg,
+               const long stride_i,
+               const long stride_j,
+               double* __restrict__ Ex_n,
+               double* __restrict__ Ey_n)
+{
+    long p = blockDim.x * blockIdx.x + threadIdx.x;
+    if (p >= N_mp) return;
+
+    double fi = 1.0 + (xn[p] - bias_x) / dx;
+    double fj = 1.0 + (yn[p] - bias_y) / dy;
+
+    // Match Fortran INT(): truncate toward zero
+    int i = (int)fi;
+    int j = (int)fj;
+
+    double hx = fi - (double)i;
+    double hy = fj - (double)j;
+
+    double Ex = 0.0, Ey = 0.0;
+    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
+        int i0 = i - 1, j0 = j - 1;
+
+        long idx00 = (long)i0 * stride_i + (long)j0 * stride_j;
+        long idx10 = (long)(i0+1) * stride_i + (long)j0 * stride_j;
+        long idx01 = (long)i0 * stride_i + (long)(j0+1) * stride_j;
+        long idx11 = (long)(i0+1) * stride_i + (long)(j0+1) * stride_j;
+
+        double w00 = (1.0 - hx) * (1.0 - hy);
+        double w10 = hx * (1.0 - hy);
+        double w01 = (1.0 - hx) * hy;
+        double w11 = hx * hy;
+
+        Ex = efx[idx00]*w00 + efx[idx10]*w10 + efx[idx01]*w01 + efx[idx11]*w11;
+        Ey = efy[idx00]*w00 + efy[idx10]*w10 + efy[idx01]*w01 + efy[idx11]*w11;
+    }
+    Ex_n[p] = Ex;
+    Ey_n[p] = Ey;
+}
+''';
+
+mod_nob = cp.RawModule(code=cuda_src_nob, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+int_field_kernel_nob = mod_nob.get_function('int_field')
+
+def _strides_in_elements(arr2d):
+    return (arr2d.strides[0] // arr2d.itemsize,
+            arr2d.strides[1] // arr2d.itemsize)
+
+@profile
+def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=None, stream=None):
+    """
+    CuPy wrapper for the int_field kernel.
+
+    Parameters
+    ----------
+    xn, yn : (N_mp,) cupy.ndarray, float64
+    bias_x, bias_y, dx, dy : float (or float64)
+    efx, efy : (Nxg, Nyg) cupy.ndarray, float64      # matches Fortran shapes
+    stream : cp.cuda.Stream or None
+
+    Returns
+    -------
+    Ex_n, Ey_n : (N_mp,) cupy.ndarray, float64
+    """
+    # Type/shape checks (lightweight)
+    # assert xn.dtype == yn.dtype == cp.float64
+    # assert efx.dtype == efy.dtype == cp.float64
+    # assert efx.shape == efy.shape and efx.ndim == 2
+
+    Nxg, Nyg = map(int, efx.shape)  # shape is (Nxg, Nyg) to mirror Fortran
+    N_mp = int(xn.size)
+
+    # Ex_n = cp.zeros_like(xn)
+    # Ey_n = cp.zeros_like(xn)
+
+    stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
+
+    threads = 512
+    blocks = (N_mp + threads - 1) // threads
+
+    args = (
+        N_mp,
+        xn, yn,
+        float(bias_x), float(bias_y),
+        float(dx), float(dy),
+        efx, efy,
+        cp.int32(Nxg), cp.int32(Nyg),
+        cp.int64(stride_i), cp.int64(stride_j),
+        Ex_n, Ey_n
+    )
+
+    if stream is None:
+        int_field_kernel_nob((blocks,), (threads,), args)
+    else:
+        with stream:
+            int_field_kernel_nob((blocks,), (threads,), args)
+
+    # return Ex_n, Ey_n
+
 cuda_src = r'''
 extern "C" __global__
 void int_field_border(const long N_mp,
@@ -540,8 +651,9 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.sparse_solver = None
             self.tol_stem = None
             self.tol_der = None
-
-        self.flag_inside_n_mat = cp.logical_not(self.flag_outside_n_mat).astype(cp.uint8, copy=False)
+        # print(self.Asel.shape)
+        self.unitarea = cp.array(self.dx*self.dy)
+        self.flag_inside_n_mat = cp.logical_not(cp.array(flag_outside_n_mat)).astype(cp.uint8, copy=False)
         self.chamb = chamb
         self.rho = cp.zeros((self.Nxg,self.Nyg));
         self.phi = cp.zeros((self.Nxg,self.Nyg));
@@ -569,10 +681,27 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             int_field_border_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
                                 self.dy, self.efx, self.efy, self.flag_inside_n_mat, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
         else:
-            Ex_sc_n=0.
-            Ey_sc_n=0.
+            Ex_sc_n=cp.array(0.)
+            Ey_sc_n=cp.array(0.)
 
         return Ex_sc_n, Ey_sc_n
+    
+    def gather_phi(self, x_mp, y_mp):
+        
+        if not (len(x_mp)==len(y_mp)):
+            raise ValueError('x_mp, y_mp should have the same length!!!')
+
+        if len(x_mp)>0:    
+            ## compute beam potential
+            phi_sc_n = cp.zeros_like(x_mp)
+            phi_sc_n2 = cp.empty_like(x_mp)
+            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+                         self.dy, self.phi, self.phi, Ex_n=phi_sc_n, Ey_n=phi_sc_n2)
+                       
+        else:
+            phi_sc_n=cp.array(0.)
+            
+        return phi_sc_n
     
     @profile
     def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
@@ -586,11 +715,10 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         else:
             rho=self.rho*0.
 
-        denom = cp.array(self.dx*self.dy)
         if flag_add:
-            self.rho+=charge*rho/denom;
+            self.rho+=charge*rho/self.unitarea;
         else:
-            self.rho=charge*rho/denom;
+            self.rho=charge*rho/self.unitarea;
 
     def build_sparse_solver(self):
 
@@ -609,7 +737,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             print("[Solver INIT]: Using cuDSS solver")
             luobj = SpMDVSolver(self.Asel.tocsr())
         else:
-            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
+            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
 
         self.luobj = luobj
 

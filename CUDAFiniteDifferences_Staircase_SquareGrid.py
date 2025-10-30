@@ -59,6 +59,9 @@ import cupy as cp
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 from cupyx.scipy.sparse.linalg import splu
 from line_profiler import profile
+from .luLU import luLU
+from .cuDSSLU import SpMDVSolver
+from tqdm import tqdm
 
 na = lambda x:np.array([x])
 
@@ -176,6 +179,125 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
 
     # return Ex_n, Ey_n
 
+kernel_code_f = r'''
+extern "C" {
+
+#if __CUDA_ARCH__ < 600 && defined(__CUDA_ARCH__)
+__device__ double atomicAdd_double(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#define ATOMIC_ADD(addr, v) atomicAdd_double((addr), (v))
+#else
+#define ATOMIC_ADD(addr, v) atomicAdd((addr), (v))
+#endif
+
+// Drop-in: matches Fortran INT/1-based logic and (i,j) indexing
+__global__ void compute_sc_rho_kernel_f(
+    const long long N_mp,
+    const double* __restrict__ x_mp,
+    const double* __restrict__ y_mp,
+    const double* __restrict__ nel_mp,
+    const double bias_x, const double bias_y,
+    const double dx, const double dy,
+    const int Nxg, const int Nyg,
+    double* __restrict__ rho,
+    const long long sx,  // stride (elements) for dim-0 (i)
+    const long long sy   // stride (elements) for dim-1 (j)
+){
+    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= N_mp) return;
+
+    double x = x_mp[p];
+    double y = y_mp[p];
+    double w = nel_mp[p];
+
+    if (!isfinite(x) || !isfinite(y) || !isfinite(w)) return;
+    if (!(dx > 0.0) || !(dy > 0.0)) return;
+
+    // Fortran-style: 1-based indices via INT (truncate toward zero)
+    double fi = 1.0 + (x - bias_x) / dx;
+    int i = (int)(fi);         // INT in Fortran (trunc toward zero)
+    double hx = fi - (double)i;
+
+    double fj = 1.0 + (y - bias_y) / dy;
+    int j = (int)(fj);
+    double hy = fj - (double)j;
+
+    // Fortran guard: if (i>0 .and. j>0 .and. i<Nxg .and. j<Nyg)
+    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
+        // Convert to 0-based offsets
+        long long i0 = (long long)(i - 1);
+        long long j0 = (long long)(j - 1);
+
+        long long idx00 = i0 * sx + j0 * sy;
+
+        double w00 = w * (1.0 - hx) * (1.0 - hy);
+        double w10 = w * (      hx) * (1.0 - hy);
+        double w01 = w * (1.0 - hx) * (      hy);
+        double w11 = w * (      hx) * (      hy);
+
+        ATOMIC_ADD(&rho[idx00             ], w00);
+        ATOMIC_ADD(&rho[idx00 + sx        ], w10);
+        ATOMIC_ADD(&rho[idx00 + sy        ], w01);
+        ATOMIC_ADD(&rho[idx00 + sx + sy   ], w11);
+    }
+}
+} // extern "C"
+'''
+mod = cp.RawModule(code=kernel_code_f,
+                   options=('-std=c++14','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
+
+@profile
+def compute_rho_gpu_dropin(
+    x_mp, y_mp, nel_mp,
+    bias_x, bias_y, dx, dy,
+    Nxg, Nyg,
+    rho=None
+):
+    # Device arrays, float64
+    # x_mp = cp.asarray(x_mp, dtype=cp.float64)
+    # y_mp = cp.asarray(y_mp, dtype=cp.float64)
+    # nel_mp = cp.asarray(nel_mp, dtype=cp.float64)
+
+    # rho shaped (Nxg, Nyg) like Fortran; default Fortran-order
+    # if rho is None:
+    #     rho = cp.zeros((Nxg, Nyg), dtype=cp.float64, order='F')
+    # else:
+    #     assert isinstance(rho, cp.ndarray)
+    #     assert rho.dtype == cp.float64
+    #     assert rho.shape == (Nxg, Nyg)
+    #     rho.fill(0.0)
+
+    # Strides in ELEMENTS (not bytes)
+    sx = rho.strides[0] // rho.itemsize
+    sy = rho.strides[1] // rho.itemsize
+
+    N_mp = int(x_mp.size)
+    threads = 512
+    blocks = (N_mp + threads - 1) // threads
+
+    compute_sc_rho_kernel_f(
+        (blocks,), (threads,),
+        (
+            cp.int64(N_mp),
+            x_mp, y_mp, nel_mp,
+            float(bias_x), float(bias_y),
+            float(dx), float(dy),
+            cp.int32(Nxg), cp.int32(Nyg),
+            rho,
+            cp.int64(sx), cp.int64(sy)
+        )
+    )
+    # return rho
+
 class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
     #@profile
     def __init__(self, chamb, Dh, sparse_solver = 'cupy_splu', remove_external_nodes_from_mat=True, include_solver = True):
@@ -221,9 +343,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             list_internal_force_zero = []
 
             # Build A matrix
-            for u in range(0,Nxg*Nyg):
-                if np.mod(u, Nxg*Nyg//20)==0:
-                    print(('Mat. assembly %.0f'%(float(u)/ float(Nxg*Nyg)*100)+"""%"""))
+            for u in tqdm(range(0,Nxg*Nyg)):
                 if flag_inside_n[u]:
                     A[u,u] = -(4./(Dh*Dh))
                     A[u,u-1]=1./(Dh*Dh);     #phi(i-1,j)nx
@@ -256,11 +376,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             Asel = csc_matrix(Asel)
             # print('Asel shape:', Asel.shape)
 
-            if sparse_solver == 'cupy_splu':
-                print("Using scipy superlu solver...")
-                luobj = splu(Asel, permc_spec="MMD_AT_PLUS_A")
-            else:
-                raise ValueError('Solver not recognized!!!!\nsparse_solver must be "scipy_slu" or "PyKLU"\n')
+            self.sparse_solver = sparse_solver
                 
             self.xn = xn
             self.yn = yn
@@ -271,18 +387,20 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             self.flag_inside_n_mat = cp.logical_not(self.flag_outside_n_mat)
             self.flag_border_mat = cp.array(flag_border_mat)
             self.Asel = Asel
-            self.luobj = luobj
             self.U_sc_eV_stp=0.;
-            self.sparse_solver = sparse_solver
             self.Msel = csc_matrix(Msel)
             self.Msel_T = csc_matrix(Msel.T)
+            self.build_sparse_solver()
+            self.x_border = cp.array(xn[flag_border_n])
+            self.y_border = cp.array(yn[flag_border_n])
             self.flag_border_n = cp.array(flag_border_n)
             
             print('Done PIC init.')
             
         else:
             self.solve = self._solve_for_states          
-
+        # print(self.Asel.shape)
+        self.unitarea = cp.array(self.dx*self.dy)
         self.Dhcp = cp.array(Dh)
         self.rho = cp.zeros((self.Nxg,self.Nyg));
         self.phi = cp.zeros((self.Nxg,self.Nyg));
@@ -290,7 +408,21 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         self.efy = cp.zeros((self.Nxg,self.Nyg));
         self.chamb = chamb
         
-        
+    def build_sparse_solver(self):
+
+        if self.sparse_solver == 'cupy_splu':
+            print("[Solver INIT]: Using CuPy splu solver")
+            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
+        elif self.sparse_solver == 'luLU':
+            print("[Solver INIT]: Using luLU solver")
+            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
+        elif self.sparse_solver == 'cuDSS':
+            print("[Solver INIT]: Using cuDSS solver")
+            luobj = SpMDVSolver(self.Asel.tocsr())
+        else:
+            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
+
+        self.luobj = luobj
         
     #@profile    
     def solve(self, rho = None, flag_verbose = False, pic_external = None):
@@ -300,7 +432,56 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             
         self._solve_core(self, rho, pic_external) #change 2
 
+    def gather(self, x_mp, y_mp):
+        
+        if not (len(x_mp)==len(y_mp)):
+            raise ValueError('x_mp, y_mp should have the same length!!!')
+
+        if len(x_mp)>0:    
+            ## compute beam electric field
+            Ex_sc_n = cp.zeros_like(x_mp)
+            Ey_sc_n = cp.zeros_like(x_mp)
+            
+            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+                         self.dy, self.efx, self.efy, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
+        else:
+            Ex_sc_n=cp.array(0.)
+            Ey_sc_n=cp.array(0.)
+            
+        return Ex_sc_n, Ey_sc_n
+
+    def gather_phi(self, x_mp, y_mp):
+        
+        if not (len(x_mp)==len(y_mp)):
+            raise ValueError('x_mp, y_mp should have the same length!!!')
+
+        if len(x_mp)>0:    
+            ## compute beam potential
+            phi_sc_n = cp.zeros_like(x_mp)
+            phi_sc_n2 = cp.empty_like(x_mp)
+            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+                         self.dy, self.phi, self.phi, Ex_n=phi_sc_n, Ey_n=phi_sc_n2)
+                       
+        else:
+            phi_sc_n=cp.array(0.)
+            
+        return phi_sc_n
     
+    def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
+        
+        if not (len(x_mp)==len(y_mp)==len(nel_mp)):
+            raise ValueError('x_mp, y_mp, nel_mp should have the same length!!!')
+        
+        if len(x_mp)>0:
+            rho = cp.zeros((self.Nxg, self.Nyg), dtype=cp.float64)
+            compute_rho_gpu_dropin(x_mp,y_mp,nel_mp,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho)
+        else:
+            rho=self.rho*0.
+
+        if flag_add:
+            self.rho+=charge*rho/self.unitarea;
+        else:
+            self.rho=charge*rho/self.unitarea;
         
     def get_state_object(self):
         state = FiniteDifferences_Staircase_SquareGrid(chamb=self.chamb, Dh=self.Dh, include_solver=False)
@@ -336,9 +517,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         b[(self.flag_outside_n)]=0.; #boundary condition
 
         if pic_external is not None:
-            x_border = self.xn[self.flag_border_n]
-            y_border = self.yn[self.flag_border_n]
-            phi_border = pic_external.gather_phi(x_border, y_border)
+            phi_border = pic_external.gather_phi(self.x_border, self.y_border)
             b[self.flag_border_n] = phi_border
 
         b_sel = self.Msel_T@b
