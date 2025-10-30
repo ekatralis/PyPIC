@@ -52,35 +52,23 @@
 
 import numpy as np
 import scipy.sparse as scsp
-# from scipy.sparse.linalg import spsolve
-# import scipy.sparse.linalg as ssl
+import scipy.sparse.linalg as ssl
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 import cupy as cp
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
-from cupyx.scipy.sparse.linalg import splu, spsolve
-from cupyx.scipy.linalg import lu_factor, lu_solve
-from cupyx.scipy.sparse.linalg import cg, gmres, LinearOperator
+from cupyx.scipy.sparse.linalg import splu
 from line_profiler import profile
-from tqdm import tqdm
-from cupy import fuse
-from cupyx.time import repeat
 from .luLU import luLU
-try:
-    from .cuDSSLU import SpMDVSolver
-except ModuleNotFoundError:
-    import warnings
-    warnings.warn("nvmath package not found. cuDSS solver unavailable")
-from . import rhocompute as rhocom
-# from . import int_field_for_border as iffb
-
+from .cuDSSLU import SpMDVSolver
+from tqdm import tqdm
 
 na = lambda x:np.array([x])
 
 qe = cp.array(e)
 eps0 = cp.array(epsilon_0)
 
-cuda_src_nob = r'''
+cuda_src = r'''
 extern "C" __global__
 void int_field(const long N_mp,
                const double* __restrict__ xn,
@@ -133,8 +121,8 @@ void int_field(const long N_mp,
 }
 ''';
 
-mod_nob = cp.RawModule(code=cuda_src_nob, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
-int_field_kernel_nob = mod_nob.get_function('int_field')
+mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+int_field_kernel = mod.get_function('int_field')
 
 def _strides_in_elements(arr2d):
     return (arr2d.strides[0] // arr2d.itemsize,
@@ -180,163 +168,6 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
         efx, efy,
         cp.int32(Nxg), cp.int32(Nyg),
         cp.int64(stride_i), cp.int64(stride_j),
-        Ex_n, Ey_n
-    )
-
-    if stream is None:
-        int_field_kernel_nob((blocks,), (threads,), args)
-    else:
-        with stream:
-            int_field_kernel_nob((blocks,), (threads,), args)
-
-    # return Ex_n, Ey_n
-
-cuda_src = r'''
-extern "C" __global__
-void int_field_border(const long N_mp,
-               const double* __restrict__ xn,
-               const double* __restrict__ yn,
-               const double bias_x,
-               const double bias_y,
-               const double dx,
-               const double dy,
-               const double* __restrict__ efx,
-               const double* __restrict__ efy,
-               const int Nxg,
-               const int Nyg,
-               const long stride_i,
-               const long stride_j,
-               const unsigned char* __restrict__ inside_mat, // NEW: byte mask (0 = outside)
-               double* __restrict__ Ex_n,
-               double* __restrict__ Ey_n)
-{
-    long p = blockDim.x * blockIdx.x + threadIdx.x;
-    if (p >= N_mp) return;
-
-    // Compute cell indices like Fortran INT() (truncate toward zero)
-    double fi = 1.0 + (xn[p] - bias_x) / dx;
-    double fj = 1.0 + (yn[p] - bias_y) / dy;
-
-    int i = (int)fi;
-    int j = (int)fj;
-
-    double hx = fi - (double)i;
-    double hy = fj - (double)j;
-
-    double Ex = 0.0, Ey = 0.0;
-
-    // Bounds: equivalent to Fortran (i>0 .and. j>0 .and. i<Nxg .and. j<Nyg)
-    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
-        // For corner nodes we use (i-1,j-1) base like your existing kernel
-        int i0 = i - 1, j0 = j - 1;
-
-        long idx00 = (long)i0       * stride_i + (long)j0       * stride_j; // (i,   j)
-        long idx10 = (long)(i0 + 1) * stride_i + (long)j0       * stride_j; // (i+1, j)
-        long idx01 = (long)i0       * stride_i + (long)(j0 + 1) * stride_j; // (i,   j+1)
-        long idx11 = (long)(i0 + 1) * stride_i + (long)(j0 + 1) * stride_j; // (i+1, j+1)
-
-        // Base bilinear weights
-        double w00 = (1.0 - hx) * (1.0 - hy);
-        double w10 = hx * (1.0 - hy);
-        double w01 = (1.0 - hx) * hy;
-        double w11 = hx * hy;
-
-        // Apply inside_mat mask per-corner; track if any corner is external
-        bool anyExternal = false;
-
-        unsigned char m00 = inside_mat[idx00];
-        unsigned char m10 = inside_mat[idx10];
-        unsigned char m01 = inside_mat[idx01];
-        unsigned char m11 = inside_mat[idx11];
-
-        if (m00 == 0) { w00 = 0.0; anyExternal = true; }
-        if (m10 == 0) { w10 = 0.0; anyExternal = true; }
-        if (m01 == 0) { w01 = 0.0; anyExternal = true; }
-        if (m11 == 0) { w11 = 0.0; anyExternal = true; }
-
-        // Gather E with possibly zeroed weights
-        Ex = efx[idx00]*w00 + efx[idx10]*w10 + efx[idx01]*w01 + efx[idx11]*w11;
-        Ey = efy[idx00]*w00 + efy[idx10]*w10 + efy[idx01]*w01 + efy[idx11]*w11;
-
-        // If any corner was external, renormalize by sum of remaining weights (if > 0)
-        if (anyExternal) {
-            double sumw = w00 + w10 + w01 + w11;
-            if (sumw > 0.0) {
-                double inv = 1.0 / sumw;
-                Ex *= inv;
-                Ey *= inv;
-            } else {
-                Ex = 0.0;
-                Ey = 0.0;
-            }
-        }
-    }
-
-    Ex_n[p] = Ex;
-    Ey_n[p] = Ey;
-}''';
-
-mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
-int_field_kernel = mod.get_function('int_field_border')
-
-@profile
-def _strides_in_elements(arr2d):
-    return (arr2d.strides[0] // arr2d.itemsize,
-            arr2d.strides[1] // arr2d.itemsize)
-
-@profile
-def int_field_border_cu(xn, yn, bias_x, bias_y, dx, dy,
-                 efx, efy, inside_mat,
-                 *, Ex_n=None, Ey_n=None, stream=None):
-    """
-    CuPy wrapper for the int_field kernel (with inside_mat masking).
-
-    Parameters
-    ----------
-    xn, yn : (N_mp,) cupy.ndarray, float64
-    bias_x, bias_y, dx, dy : float
-    efx, efy : (Nxg, Nyg) cupy.ndarray, float64
-    inside_mat : (Nxg, Nyg) cupy.ndarray, uint8/byte (0 => outside, nonzero => inside)
-    Ex_n, Ey_n : optional output buffers (float64); if None they are allocated
-    stream : cp.cuda.Stream or None
-
-    Returns
-    -------
-    Ex_n, Ey_n : (N_mp,) cupy.ndarray, float64
-    """
-    # basic shape checks
-    Nxg, Nyg = map(int, efx.shape)
-    # assert efy.shape == (Nxg, Nyg)
-    # assert inside_mat.shape == (Nxg, Nyg), "inside_mat must match efx/efy shape"
-    # inside_mat must be byte/uint8 for the kernel's unsigned char*
-    if inside_mat.dtype != cp.uint8:
-        inside_mat = inside_mat.astype(cp.uint8, copy=False)
-
-    N_mp = int(xn.size)
-
-    # allocate outputs if needed
-    # if Ex_n is None: Ex_n = cp.empty_like(xn)
-    # if Ey_n is None: Ey_n = cp.empty_like(xn)
-
-    # ensure strides are consistent across the three 2D fields
-    stride_i, stride_j = _strides_in_elements(efx)
-    # si2, sj2 = _strides_in_elements(efy)
-    # sim, sjm = _strides_in_elements(inside_mat)
-    # assert (si2, sj2) == (stride_i, stride_j), "efy must share layout with efx"
-    # assert (sim, sjm) == (stride_i, stride_j), "inside_mat must share layout with efx"
-
-    threads = 512
-    blocks = (N_mp + threads - 1) // threads
-
-    args = (
-        cp.int64(N_mp),
-        xn, yn,
-        float(bias_x), float(bias_y),
-        float(dx), float(dy),
-        efx, efy,
-        cp.int32(Nxg), cp.int32(Nyg),
-        cp.int64(stride_i), cp.int64(stride_j),
-        inside_mat,                # <-- NEW: mask goes before outputs
         Ex_n, Ey_n
     )
 
@@ -467,18 +298,24 @@ def compute_rho_gpu_dropin(
     )
     # return rho
 
-class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
-    @profile
-    def __init__(self,chamb, Dh, sparse_solver = 'cupy_splu', tol_stem = 0.01, tol_der = 0.1, include_solver=True):
-
+class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
+    #@profile
+    def __init__(self, chamb, Dh, sparse_solver = 'cupy_splu', remove_external_nodes_from_mat=True, include_solver = True):
+        
         print('Start PIC init.:')
-        print('Finite Differences, Shortley-Weller, Square Grid')
-        print('Using Shortley-Weller boundary approx.')
+        print('Finite Differences, Square Grid')
+
 
         self.Dh = Dh
-        super(FiniteDifferences_ShortleyWeller_SquareGrid, self).__init__(chamb.x_aper, chamb.y_aper, self.Dh, self.Dh)
-        Nyg, Nxg = self.Nyg, self.Nxg
+        if hasattr(chamb, 'x_min') and hasattr(chamb, 'x_max') and hasattr(chamb, 'y_min') and hasattr(chamb, 'y_max'):
+            super(FiniteDifferences_Staircase_SquareGrid, self).__init__(dx = self.Dh, dy = self.Dh, 
+                x_min = chamb.x_min, x_max = chamb.x_max, y_min = chamb.y_min, y_max = chamb.y_max)
+        else:
+            super(FiniteDifferences_Staircase_SquareGrid, self).__init__(chamb.x_aper, chamb.y_aper, self.Dh, self.Dh)
 
+        Nyg, Nxg = self.Nyg, self.Nxg
+        
+        
         [xn, yn]=np.meshgrid(self.xg,self.yg)
 
         xn=xn.T
@@ -491,201 +328,128 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         flag_outside_n=chamb.is_outside(xn,yn)
         flag_inside_n=~(flag_outside_n)
 
+
         flag_outside_n_mat=np.reshape(flag_outside_n,(Nyg,Nxg),'F');
         flag_outside_n_mat=flag_outside_n_mat.T
         [gx,gy]=np.gradient(np.double(flag_outside_n_mat));
         gradmod=abs(gx)+abs(gy);
         flag_border_mat=np.logical_and((gradmod>0), flag_outside_n_mat);
         flag_border_n = flag_border_mat.flatten()
-
-
+        
+        
         if include_solver:
             A=scsp.lil_matrix((Nxg*Nyg,Nxg*Nyg)); #allocate a sparse matrix
-            Dx=scsp.lil_matrix((Nxg*Nyg,Nxg*Nyg)); #allocate a sparse matrix
-            Dy=scsp.lil_matrix((Nxg*Nyg,Nxg*Nyg)); #allocate a sparse matrix
 
             list_internal_force_zero = []
-            # Build A Dx Dy matrices 
-            for u in tqdm(range(0,Nxg*Nyg), desc="Mat Assembly"):
+
+            # Build A matrix
+            for u in tqdm(range(0,Nxg*Nyg)):
                 if flag_inside_n[u]:
-
-                    #Compute Shortley-Weller coefficients
-                    if flag_inside_n[u-1]: #phi(i-1,j)
-                        hw = Dh
-                    else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-1]), na(yn[u-1]), na(0.), resc_fac=.995, flag_robust=False)
-                        hw = np.abs(y_int[0]-yn[u])
-
-                    if flag_inside_n[u+1]: #phi(i+1,j)
-                        he = Dh
-                    else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+1]), na(yn[u+1]), na(0.), resc_fac=.995, flag_robust=False)
-                        he = np.abs(y_int[0]-yn[u])
-
-                    if flag_inside_n[u-Nyg]: #phi(i,j-1)
-                        hs = Dh
-                    else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-Nyg]), na(yn[u-Nyg]), na(0.), resc_fac=.995, flag_robust=False)
-                        hs = np.abs(x_int[0]-xn[u])
-                        #~ print hs
-
-                    if flag_inside_n[u+Nyg]: #phi(i,j+1)
-                        hn = Dh
-                    else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+Nyg]), na(yn[u+Nyg]), na(0.), resc_fac=.995, flag_robust=False)
-                        hn = np.abs(x_int[0]-xn[u])
-                        #~ print hn
-
-
-                    # Build A matrix
-                    if hn<Dh*tol_stem or hs<Dh*tol_stem or hw<Dh*tol_stem or he<Dh*tol_stem: # nodes very close to the bounday
-                        A[u,u] =1.
-                        list_internal_force_zero.append(u)
-                        #print u, xn[u], yn[u]
-                    else:
-                        A[u,u] = -(2./(he*hw)+2/(hs*hn))
-                        A[u,u-1]=2./(hw*(hw+he));     #phi(i-1,j)nx
-                        A[u,u+1]=2./(he*(hw+he));     #phi(i+1,j)
-                        A[u,u-Nyg]=2./(hs*(hs+hn));    #phi(i,j-1)
-                        A[u,u+Nyg]=2./(hn*(hs+hn));    #phi(i,j+1)
-
-                    # Build Dx matrix
-                    if hn<Dh*tol_der:
-                        if hs>=Dh*tol_der:
-                            Dx[u,u] = -1./hs
-                            Dx[u,u-Nyg]=1./hs
-                    elif hs<Dh*tol_der:
-                        if hn>=Dh*tol_der:
-                            Dx[u,u] = 1./hn
-                            Dx[u,u+Nyg]=-1./hn
-                    else:
-                        Dx[u,u] = (1./(2*hn)-1./(2*hs))
-                        Dx[u,u-Nyg]=1./(2*hs)
-                        Dx[u,u+Nyg]=-1./(2*hn)
-
-
-                    # Build Dy matrix	
-                    if he<Dh*tol_der:
-                        if hw>=Dh*tol_der:
-                            Dy[u,u] = -1./hw
-                            Dy[u,u-1]=1./hw
-                    elif hw<Dh*tol_der:
-                        if he>=Dh*tol_der:
-                            Dy[u,u] = 1./he
-                            Dy[u,u+1]=-1./(he)
-                    else:
-                        Dy[u,u] = (1./(2*he)-1./(2*hw))
-                        Dy[u,u-1]=1./(2*hw)
-                        Dy[u,u+1]=-1./(2*he)
-
+                    A[u,u] = -(4./(Dh*Dh))
+                    A[u,u-1]=1./(Dh*Dh);     #phi(i-1,j)nx
+                    A[u,u+1]=1./(Dh*Dh);     #phi(i+1,j)
+                    A[u,u-Nyg]=1./(Dh*Dh);    #phi(i,j-1)
+                    A[u,u+Nyg]=1./(Dh*Dh);    #phi(i,j+1)
                 else:
                     # external nodes
                     A[u,u]=1.
-
-
-            flag_force_zero = flag_outside_n.copy()
-            for ind in list_internal_force_zero:
-                flag_force_zero[ind] = True
-
-            flag_force_zero_mat=np.reshape(flag_force_zero,(Nyg,Nxg),'F');
-            flag_force_zero_mat=flag_force_zero_mat.T
-
-            print('Internal nodes with 0 potential')
-            print(list_internal_force_zero)
-
+                    
             A=A.tocsr() #convert to csr format
-
+            
             #Remove trivial equtions 
-            diagonal = A.diagonal()
-            N_full = len(diagonal)
-            indices_non_id = np.where(diagonal!=1.)[0]
-            N_sel = len(indices_non_id)
-
-            Msel = scsp.lil_matrix((N_full, N_sel))
-            for ii, ind in enumerate(indices_non_id):
-                Msel[ind, ii] =1.
-
+            if remove_external_nodes_from_mat:
+                diagonal = A.diagonal()
+                N_full = len(diagonal)
+                indices_non_id = np.where(diagonal!=1.)[0]
+                N_sel = len(indices_non_id)
+                Msel = scsp.lil_matrix((N_full, N_sel))
+                for ii, ind in enumerate(indices_non_id):
+                    Msel[ind, ii] =1.
+            else:
+                diagonal = A.diagonal()
+                N_full = len(diagonal)
+                Msel = scsp.lil_matrix((N_full, N_full))
+                for ii in range(N_full):
+                    Msel[ii, ii] =1.
             Msel = Msel.tocsc()
-
             Asel = Msel.T*A*Msel
-            Asel=Asel.tocsc()
+            Asel = csc_matrix(Asel)
+            # print('Asel shape:', Asel.shape)
 
-
+            self.sparse_solver = sparse_solver
+                
             self.xn = xn
             self.yn = yn
-
+            
             self.flag_inside_n = cp.array(flag_inside_n)
             self.flag_outside_n = cp.array(flag_outside_n)
             self.flag_outside_n_mat = cp.array(flag_outside_n_mat)
-            self.flag_force_zero = cp.array(flag_force_zero)
-            self.Asel = csc_matrix(Asel)
-            self.Acsr = csr_matrix(Asel)
-
-            self.Dx = csc_matrix(Dx)
-
-            self.Dy = csc_matrix(Dy)
-
-            self.sparse_solver = sparse_solver
-
-            if self.sparse_solver == 'cupy_custom': 
-                self.A = csc_matrix(A)
-
+            self.flag_inside_n_mat = cp.logical_not(self.flag_outside_n_mat)
+            self.flag_border_mat = cp.array(flag_border_mat)
+            self.Asel = Asel
             self.U_sc_eV_stp=0.;
-
-
             self.Msel = csc_matrix(Msel)
             self.Msel_T = csc_matrix(Msel.T)
-
-            #initialize self.luobj
             self.build_sparse_solver()
-
-
-            self.tol_der = tol_der
-            self.tol_stem = tol_stem
-
+            self.x_border = cp.array(xn[flag_border_n])
+            self.y_border = cp.array(yn[flag_border_n])
+            self.flag_border_n = cp.array(flag_border_n)
+            
             print('Done PIC init.')
-
+            
         else:
-
-            self.solve = self._solve_for_states
-            self.sparse_solver = None
-            self.tol_stem = None
-            self.tol_der = None
+            self.solve = self._solve_for_states          
         # print(self.Asel.shape)
         self.unitarea = cp.array(self.dx*self.dy)
-        self.flag_inside_n_mat = cp.logical_not(cp.array(flag_outside_n_mat)).astype(cp.uint8, copy=False)
-        self.chamb = chamb
+        self.Dhcp = cp.array(Dh)
         self.rho = cp.zeros((self.Nxg,self.Nyg));
         self.phi = cp.zeros((self.Nxg,self.Nyg));
         self.efx = cp.zeros((self.Nxg,self.Nyg));
         self.efy = cp.zeros((self.Nxg,self.Nyg));
+        self.chamb = chamb
+        
+    def build_sparse_solver(self):
 
+        if self.sparse_solver == 'cupy_splu':
+            print("[Solver INIT]: Using CuPy splu solver")
+            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
+        elif self.sparse_solver == 'luLU':
+            print("[Solver INIT]: Using luLU solver")
+            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
+        elif self.sparse_solver == 'cuDSS':
+            print("[Solver INIT]: Using cuDSS solver")
+            luobj = SpMDVSolver(self.Asel.tocsr())
+        else:
+            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
+
+        self.luobj = luobj
+        
     #@profile    
-    def solve(self, rho = None, flag_verbose = False):
+    def solve(self, rho = None, flag_verbose = False, pic_external = None):
 
         if rho is None:
             rho = self.rho
-        self._solve_core(self, rho)
+            
+        self._solve_core(self, rho, pic_external) #change 2
 
-    @profile
     def gather(self, x_mp, y_mp):
-
+        
         if not (len(x_mp)==len(y_mp)):
             raise ValueError('x_mp, y_mp should have the same length!!!')
 
-        if len(x_mp)>0:
+        if len(x_mp)>0:    
             ## compute beam electric field
-            Ex_sc_n = cp.empty_like(x_mp)
-            Ey_sc_n = cp.empty_like(x_mp)
+            Ex_sc_n = cp.zeros_like(x_mp)
+            Ey_sc_n = cp.zeros_like(x_mp)
             
-            int_field_border_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                                self.dy, self.efx, self.efy, self.flag_inside_n_mat, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
+            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
+                         self.dy, self.efx, self.efy, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
         else:
             Ex_sc_n=cp.array(0.)
             Ey_sc_n=cp.array(0.)
-
+            
         return Ex_sc_n, Ey_sc_n
-    
+
     def gather_phi(self, x_mp, y_mp):
         
         if not (len(x_mp)==len(y_mp)):
@@ -703,7 +467,6 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             
         return phi_sc_n
     
-    @profile
     def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
         
         if not (len(x_mp)==len(y_mp)==len(nel_mp)):
@@ -719,80 +482,71 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.rho+=charge*rho/self.unitarea;
         else:
             self.rho=charge*rho/self.unitarea;
-
-    def build_sparse_solver(self):
-
-        if self.sparse_solver == 'cupy_splu':
-            print("[Solver INIT]: Using CuPy splu solver")
-            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
-        elif self.sparse_solver == 'cupy_custom':
-            print("[Solver INIT]: Using CuPy no selection")
-            # luobj = None
-            luobj = splu(self.A, permc_spec="MMD_AT_PLUS_A")
-            self._solve_core = self._solve_core_iter
-        elif self.sparse_solver == 'luLU':
-            print("[Solver INIT]: Using luLU solver")
-            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
-        elif self.sparse_solver == 'cuDSS':
-            print("[Solver INIT]: Using cuDSS solver")
-            luobj = SpMDVSolver(self.Asel.tocsr())
-        else:
-            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
-
-        self.luobj = luobj
-
+        
     def get_state_object(self):
-        state = FiniteDifferences_ShortleyWeller_SquareGrid(chamb=self.chamb, Dh=self.Dh,
-                    sparse_solver = self.sparse_solver, tol_stem = self.tol_stem, tol_der = self.tol_der,
-                    include_solver=False)
-
+        state = FiniteDifferences_Staircase_SquareGrid(chamb=self.chamb, Dh=self.Dh, include_solver=False)
+        
         state.rho = self.rho.copy()
         state.phi = self.phi.copy()
         state.efx = self.efx.copy()
         state.efy = self.efy.copy()
-
-        return state
-
-
-    def solve_states(self, states):
-
+        
+        return state		
+        
+    def solve_states(self, states, pic_s_external = None):
+        
         states = np.atleast_1d(states)
+        if pic_s_external is None:
+            pic_s_external = len(states)*[None]
+        else:
+            pic_s_external = np.atleast_1d(pic_s_external)
+            
+        if len(pic_s_external) != len(states):
+            raise ValueError('Found len(pic_s_external) != len(states)!!!!')
+        
         for ii in range(len(states)):
             state = states[ii]
-            self._solve_core(state, state.rho)
+            pic_external = pic_s_external[ii]
+            self._solve_core(state, state.rho, pic_external)
+                
 
-    @profile
-    def _solve_core(self, state, rho):
+    @profile            
+    def _solve_core(self, state, rho, pic_external):
 
         b=-rho.flatten()/eps0;
-        b[(self.flag_force_zero)]=0;
+        b[(self.flag_outside_n)]=0.; #boundary condition
+
+        if pic_external is not None:
+            phi_border = pic_external.gather_phi(self.x_border, self.y_border)
+            b[self.flag_border_n] = phi_border
+
         b_sel = self.Msel_T@b
         phi_sel = self.luobj.solve(b_sel)
         phi = self.Msel@phi_sel
-
-        efx = self.Dx@phi
-        efy = self.Dy@phi
         phi=cp.reshape(phi,(self.Nxg,self.Nyg))
-        efx=cp.reshape(efx,(self.Nxg,self.Nyg))
-        efy=cp.reshape(efy,(self.Nxg,self.Nyg))
-        state.efx = efx
-        state.efy = efy
+
+        efx = state.efx
+        efy = state.efy
+
+        efx[1:self.Nxg-1,:] = phi[0:self.Nxg-2,:] - phi[2:self.Nxg,:];  #central difference on internal nodes
+        efy[:,1:self.Nyg-1] = phi[:,0:self.Nyg-2] - phi[:,2:self.Nyg];  #central difference on internal nodes
+
+        efx[self.flag_border_mat]=efx[self.flag_border_mat]*2;
+        efy[self.flag_border_mat]=efy[self.flag_border_mat]*2;
+
+        state.efx = efx / (2*self.Dhcp);    #divide grid size
+        state.efy = efy / (2*self.Dhcp);
+        state.rho = rho
         state.phi = phi
-    
-    @profile
-    def _solve_core_iter(self, state, rho):
+        state.b = b
         
-        b=-rho.flatten()/eps0;
-        b[(self.flag_force_zero)]=0;
-        phi = self.luobj.solve(b)
 
-        efx = self.Dx@phi
-        efy = self.Dy@phi
-        phi=cp.reshape(phi,(self.Nxg,self.Nyg))
-        efx=cp.reshape(efx,(self.Nxg,self.Nyg))
-        efy=cp.reshape(efy,(self.Nxg,self.Nyg))
-        state.efx = efx
-        state.efy = efy
-        state.phi = phi
+        
+        
+
+
+
+
+
 
 
