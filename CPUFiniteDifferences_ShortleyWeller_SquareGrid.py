@@ -302,7 +302,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
         if self.sparse_solver == 'scipy_slu':
             print("Using scipy superlu solver...")
-            luobj = ssl.splu(self.Asel.tocsc())
+            luobj = ssl.splu(self.Asel.tocsc(),permc_spec="MMD_AT_PLUS_A")
         elif self.sparse_solver == 'PyKLU':
             print("Using klu solver...")
             try:

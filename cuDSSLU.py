@@ -5,7 +5,7 @@ import nvmath
 class SpMDVSolver(nvmath.sparse.advanced.DirectSolver):
     """cuDSS-based direct solver; reuse factors for many RHS (SuperLU-style)."""
 
-    def __init__(self, A, *, assume_general=True, order_rhs='auto', **kwargs):
+    def __init__(self, A, *, n_batches: int = 0,assume_general=True, order_rhs='auto', **kwargs):
         # 1) Validate A
         if not isinstance(A, sp.csr_matrix):
             raise TypeError("A must be cupyx.scipy.sparse.csr_matrix")
@@ -15,7 +15,10 @@ class SpMDVSolver(nvmath.sparse.advanced.DirectSolver):
             A = sp.csr_matrix((A.data, A.indices.astype(cp.int32), A.indptr.astype(cp.int32)),
                               shape=A.shape)
         # 2) Sample RHS to initialize parent
-        b_sample = cp.zeros(A.shape[0], dtype=A.dtype)
+        if n_batches == 0:
+            b_sample = cp.zeros(A.shape[0], dtype=A.dtype)
+        else:
+            b_sample = cp.zeros((A.shape[0],n_batches), dtype=A.dtype, order = 'F')
         self.b_dtype = A.dtype
         super().__init__(A, b_sample, **kwargs)
 
