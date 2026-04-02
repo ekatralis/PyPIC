@@ -221,7 +221,7 @@ def int_field_border_cu(xn, yn, bias_x, bias_y, dx, dy,
     else:
         with stream:
             int_field_kernel((blocks,), (threads,), args)
-
+    # cp.cuda.get_current_stream().synchronize()
     return Ex_n, Ey_n
 
 
@@ -445,9 +445,10 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             Ex_sc_n, Ey_sc_n = iffb.int_field_border(x_mp,y_mp,self.bias_x,self.bias_y,self.Dh,
                                          self.Dh, self.efx, self.efy, self.flag_inside_n_mat)
-            
+            # cp.cuda.get_current_stream().synchronize()
             Ex_sc_n_gpu, Ey_sc_n_gpu = int_field_border_cu(x_mp_gpu,y_mp_gpu,self.bias_x,self.bias_y,self.dx,
                                          self.dy, efx, efy, inside_mat_GPU, Ex_n=Exn, Ey_n=Eyn)
+            # cp.cuda.get_current_stream().synchronize()
             np.testing.assert_allclose(Ex_sc_n,nar(Ex_sc_n_gpu),atol=1e-7,rtol = 1e-4)
             np.testing.assert_allclose(Ey_sc_n,nar(Ey_sc_n_gpu),atol=1e-7,rtol = 1e-4)
         else:

@@ -167,7 +167,8 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
     else:
         with stream:
             int_field_kernel((blocks,), (threads,), args)
-
+            
+    # cp.cuda.get_current_stream().synchronize()
     return Ex_n, Ey_n
 
 kernel_code = r'''
@@ -382,6 +383,7 @@ def compute_rho_gpu_dropin(
             cp.int64(sx), cp.int64(sy)
         )
     )
+    # cp.cuda.get_current_stream().synchronize()
     return rho
 
 
@@ -584,7 +586,9 @@ class PyPIC_Scatter_Gather(object):
 
             rho_gpuT = cp.zeros((self.Nyg, self.Nxg), dtype=cp.float64)
             rho_gpuT = compute_rho_gpu(x_mp_gpu,y_mp_gpu,nel_mp_gpu,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho_gpuT)
+            # cp.cuda.get_current_stream().synchronize()
             rho_gpu = compute_rho_gpu_dropin(x_mp_gpu,y_mp_gpu,nel_mp_gpu,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho_gpu)
+            # cp.cuda.get_current_stream().synchronize()
             # rho_gpuF = cp.zeros((self.Nxg, self.Nyg), dtype=cp.float64)
             # rho_gpuF = compute_rho_gpu_dropin_fast(x_mp_gpu,y_mp_gpu,nel_mp_gpu,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho_gpuF)
 
@@ -619,9 +623,10 @@ class PyPIC_Scatter_Gather(object):
             Eyn = cp.zeros_like(x_mp_gpu)
             Ex_sc_n, Ey_sc_n = iff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
                                          self.dy, self.efx, self.efy)
-            
+            # cp.cuda.get_current_stream().synchronize()
             Ex_sc_n_gpu, Ey_sc_n_gpu = int_field_cu(x_mp_gpu,y_mp_gpu,self.bias_x,self.bias_y,self.dx,
                                          self.dy, efx, efy, Ex_n=Exn, Ey_n=Eyn)
+            # cp.cuda.get_current_stream().synchronize()
             np.testing.assert_allclose(Ex_sc_n,nar(Ex_sc_n_gpu),atol=1e-7,rtol = 1e-4)
             np.testing.assert_allclose(Ey_sc_n,nar(Ey_sc_n_gpu),atol=1e-7,rtol = 1e-4)
             
