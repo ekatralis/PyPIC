@@ -22,7 +22,13 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
             #check if the internal grid lies inside the chamber
             x_border = self.pic_internal.xn[self.pic_internal.flag_border_n.get()]
             y_border = self.pic_internal.yn[self.pic_internal.flag_border_n.get()]
-            if pic_external.chamb.is_outside(x_border, y_border).any() == True:
+            if hasattr(pic_external.chamb, 'use_gpu') and pic_external.chamb.use_gpu:
+                xn_gpu = cp.asarray(x_border)
+                yn_gpu = cp.asarray(y_border)
+                outside_points = cp.asnumpy(pic_external.chamb.is_outside(xn_gpu, yn_gpu))
+            else:
+                flag_outside_n=pic_external.chamb.is_outside(x_border, y_border)
+            if outside_points.any() == True:
                 raise ValueError('The internal grid is outside the chamber!')
 
             
