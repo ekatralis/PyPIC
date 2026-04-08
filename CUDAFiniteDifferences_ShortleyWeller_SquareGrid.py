@@ -133,7 +133,10 @@ void int_field(const long N_mp,
 }
 ''';
 
-mod_nob = cp.RawModule(code=cuda_src_nob, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+mod_nob = cp.RawModule(
+    code=cuda_src_nob,
+    options=('--std=c++11', '--use_fast_math'),
+    backend='nvrtc')
 int_field_kernel_nob = mod_nob.get_function('int_field')
 
 def _strides_in_elements(arr2d):
@@ -276,7 +279,10 @@ void int_field_border(const long N_mp,
     Ey_n[p] = Ey;
 }''';
 
-mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+mod = cp.RawModule(
+    code=cuda_src,
+    options=('--std=c++11', '--use_fast_math'),
+    backend='nvrtc')
 int_field_kernel = mod.get_function('int_field_border')
 
 @profile
@@ -420,8 +426,10 @@ __global__ void compute_sc_rho_kernel_f(
 }
 } // extern "C"
 '''
-mod = cp.RawModule(code=kernel_code_f,
-                   options=('-std=c++14','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+mod = cp.RawModule(
+    code=kernel_code_f,
+    options=('--std=c++14', '--use_fast_math'),
+    backend='nvrtc')
 compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
 
 @profile
@@ -487,8 +495,12 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         yn=yn.T
         yn=yn.flatten()
         #% xn and yn are stored such that the external index is on x 
-
-        flag_outside_n=chamb.is_outside(xn,yn)
+        if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
+            xn_gpu = cp.asarray(xn)
+            yn_gpu = cp.asarray(yn)
+            flag_outside_n = cp.asnumpy(chamb.is_outside(xn_gpu, yn_gpu))
+        else:
+            flag_outside_n=chamb.is_outside(xn,yn)
         flag_inside_n=~(flag_outside_n)
 
         flag_outside_n_mat=np.reshape(flag_outside_n,(Nyg,Nxg),'F');
@@ -506,6 +518,10 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             list_internal_force_zero = []
             # Build A Dx Dy matrices 
+            if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
+                impact_point_and_normal_kwargs = dict(resc_fac=.995, flag_robust=False, force_cpu=True)
+            else:
+                impact_point_and_normal_kwargs = dict(resc_fac=.995, flag_robust=False)
             for u in tqdm(range(0,Nxg*Nyg), desc="Mat Assembly"):
                 if flag_inside_n[u]:
 
@@ -513,26 +529,26 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
                     if flag_inside_n[u-1]: #phi(i-1,j)
                         hw = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-1]), na(yn[u-1]), na(0.), resc_fac=.995, flag_robust=False)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-1]), na(yn[u-1]), na(0.), **impact_point_and_normal_kwargs)
                         hw = np.abs(y_int[0]-yn[u])
 
                     if flag_inside_n[u+1]: #phi(i+1,j)
                         he = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+1]), na(yn[u+1]), na(0.), resc_fac=.995, flag_robust=False)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+1]), na(yn[u+1]), na(0.), **impact_point_and_normal_kwargs)
                         he = np.abs(y_int[0]-yn[u])
 
                     if flag_inside_n[u-Nyg]: #phi(i,j-1)
                         hs = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-Nyg]), na(yn[u-Nyg]), na(0.), resc_fac=.995, flag_robust=False)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-Nyg]), na(yn[u-Nyg]), na(0.), **impact_point_and_normal_kwargs)
                         hs = np.abs(x_int[0]-xn[u])
                         #~ print hs
 
                     if flag_inside_n[u+Nyg]: #phi(i,j+1)
                         hn = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+Nyg]), na(yn[u+Nyg]), na(0.), resc_fac=.995, flag_robust=False)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+Nyg]), na(yn[u+Nyg]), na(0.), **impact_point_and_normal_kwargs)
                         hn = np.abs(x_int[0]-xn[u])
                         #~ print hn
 
@@ -794,5 +810,4 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         state.efx = efx
         state.efy = efy
         state.phi = phi
-
 

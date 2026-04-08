@@ -121,7 +121,10 @@ void int_field(const long N_mp,
 }
 ''';
 
-mod = cp.RawModule(code=cuda_src, options=('-std=c++11','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+mod = cp.RawModule(
+    code=cuda_src,
+    options=('--std=c++11', '--use_fast_math'),
+    backend='nvrtc')
 int_field_kernel = mod.get_function('int_field')
 
 def _strides_in_elements(arr2d):
@@ -251,8 +254,10 @@ __global__ void compute_sc_rho_kernel_f(
 }
 } // extern "C"
 '''
-mod = cp.RawModule(code=kernel_code_f,
-                   options=('-std=c++14','-O3','--use_fast_math','--gpu-architecture=sm_70',), backend='nvcc')
+mod = cp.RawModule(
+    code=kernel_code_f,
+    options=('--std=c++14', '--use_fast_math'),
+    backend='nvrtc')
 compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
 
 @profile
@@ -325,7 +330,12 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         yn=yn.flatten()
         #% xn and yn are stored such that the external index is on x 
 
-        flag_outside_n=chamb.is_outside(xn,yn)
+        if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
+            xn_gpu = cp.asarray(xn)
+            yn_gpu = cp.asarray(yn)
+            flag_outside_n = cp.asnumpy(chamb.is_outside(xn_gpu, yn_gpu))
+        else:
+            flag_outside_n=chamb.is_outside(xn,yn)
         flag_inside_n=~(flag_outside_n)
 
 
@@ -458,7 +468,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         if len(x_mp)>0:    
             ## compute beam potential
             phi_sc_n = cp.zeros_like(x_mp)
-            phi_sc_n2 = cp.empty_like(x_mp)
+            phi_sc_n2 = cp.zeros_like(x_mp)
             int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
                          self.dy, self.phi, self.phi, Ex_n=phi_sc_n, Ey_n=phi_sc_n2)
                        
@@ -543,7 +553,6 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
 
         
         
-
 
 
 
