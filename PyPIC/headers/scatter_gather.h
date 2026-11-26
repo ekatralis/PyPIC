@@ -22,7 +22,7 @@ GPUKERN void compute_sc_rho(
     const int64_t Nxg, const int64_t Nyg,
     GPUGLMEM double* rho)
 {
-    VECTORIZE_OVER(p, N_mp)
+    VECTORIZE_OVER(p, N_mp);
         const double fi = 1. + (x_mp[p] - bias_x) / dx;
         const int64_t i = (int64_t)fi;
         const double hx = fi - (double)i;
@@ -38,7 +38,7 @@ GPUKERN void compute_sc_rho(
             atomicAdd(&rho[ij + 1], nel * (1. - hx) * hy);
             atomicAdd(&rho[ij + Nyg + 1], nel * hx * hy);
         }
-    END_VECTORIZE
+    END_VECTORIZE;
 }
 
 
@@ -50,7 +50,7 @@ GPUKERN void int_field(
     const int64_t Nxg, const int64_t Nyg,
     GPUGLMEM double* Ex_n, GPUGLMEM double* Ey_n)
 {
-    VECTORIZE_OVER(p, N_mp)
+    VECTORIZE_OVER(p, N_mp);
         const double fi = 1. + (x_mp[p] - bias_x) / dx;
         const int64_t i = (int64_t)fi;
         const double hx = fi - (double)i;
@@ -73,7 +73,7 @@ GPUKERN void int_field(
         }
         Ex_n[p] = Ex;
         Ey_n[p] = Ey;
-    END_VECTORIZE
+    END_VECTORIZE;
 }
 
 
@@ -87,7 +87,7 @@ GPUKERN void int_field_border(
     const int64_t Nxg, const int64_t Nyg,
     GPUGLMEM double* Ex_n, GPUGLMEM double* Ey_n)
 {
-    VECTORIZE_OVER(p, N_mp)
+    VECTORIZE_OVER(p, N_mp);
         const double fi = 1. + (x_mp[p] - bias_x) / dx;
         const int64_t i = (int64_t)fi;
         const double hx = fi - (double)i;
@@ -128,7 +128,7 @@ GPUKERN void int_field_border(
         }
         Ex_n[p] = Ex;
         Ey_n[p] = Ey;
-    END_VECTORIZE
+    END_VECTORIZE;
 }
 
 #endif // PYPIC_SCATTER_GATHER_H

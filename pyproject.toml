@@ -18,6 +18,10 @@ tests = ["pytest"]
 examples = ["matplotlib"]
 fftw = ["pyfftw"]
 
+# Lets xobjects kernels include "PyPIC/headers/..."
+[project.entry-points.xobjects]
+include = "PyPIC"
+
 [tool.setuptools]
 include-package-data = false
 py-modules = []

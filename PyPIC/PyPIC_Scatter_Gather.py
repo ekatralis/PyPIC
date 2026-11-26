@@ -50,33 +50,66 @@
 #     all references.                                                  
 #----------------------------------------------------------------------
 
-from pathlib import Path
 import numpy as np
 import xobjects as xo
 #~ from abc import abstractmethod, ABCMeta
 
 na = lambda x:np.array([x])
 
-_grid_args = [xo.Arg(xo.Float64, name=name) for name in ('bias_x', 'bias_y', 'dx', 'dy')]
-_particle_args = [xo.Arg(xo.Int64, name='N_mp'),
-                  xo.Arg(xo.Float64, pointer=True, const=True, name='x_mp'),
-                  xo.Arg(xo.Float64, pointer=True, const=True, name='y_mp')]
-_grid_size_args = [xo.Arg(xo.Int64, name='Nxg'), xo.Arg(xo.Int64, name='Nyg')]
-_field_out_args = [xo.Arg(xo.Float64, pointer=True, name='Ex_n'), xo.Arg(xo.Float64, pointer=True, name='Ey_n')]
-_field_in_args = [xo.Arg(xo.Float64, pointer=True, const=True, name='efx'),
-                  xo.Arg(xo.Float64, pointer=True, const=True, name='efy')]
 _kernels = {
-    'compute_sc_rho': xo.Kernel(
-        args=_particle_args + [xo.Arg(xo.Float64, pointer=True, const=True, name='nel_mp')]
-        + _grid_args + _grid_size_args + [xo.Arg(xo.Float64, pointer=True, name='rho')],
-        n_threads='N_mp'),
-    'int_field': xo.Kernel(
-        args=_particle_args + _grid_args + _field_in_args + _grid_size_args + _field_out_args,
-        n_threads='N_mp'),
-    'int_field_border': xo.Kernel(
-        args=_particle_args + _grid_args + _field_in_args
-        + [xo.Arg(xo.Int8, pointer=True, const=True, name='inside_mat')] + _grid_size_args + _field_out_args,
-        n_threads='N_mp'),
+    "compute_sc_rho": xo.Kernel(
+        args=[
+            xo.Arg(xo.Int64, name="N_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="x_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="y_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="nel_mp"),
+            xo.Arg(xo.Float64, name="bias_x"),
+            xo.Arg(xo.Float64, name="bias_y"),
+            xo.Arg(xo.Float64, name="dx"),
+            xo.Arg(xo.Float64, name="dy"),
+            xo.Arg(xo.Int64, name="Nxg"),
+            xo.Arg(xo.Int64, name="Nyg"),
+            xo.Arg(xo.Float64, pointer=True, name="rho"),
+        ],
+        n_threads="N_mp",
+    ),
+    "int_field": xo.Kernel(
+        args=[
+            xo.Arg(xo.Int64, name="N_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="x_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="y_mp"),
+            xo.Arg(xo.Float64, name="bias_x"),
+            xo.Arg(xo.Float64, name="bias_y"),
+            xo.Arg(xo.Float64, name="dx"),
+            xo.Arg(xo.Float64, name="dy"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="efx"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="efy"),
+            xo.Arg(xo.Int64, name="Nxg"),
+            xo.Arg(xo.Int64, name="Nyg"),
+            xo.Arg(xo.Float64, pointer=True, name="Ex_n"),
+            xo.Arg(xo.Float64, pointer=True, name="Ey_n"),
+        ],
+        n_threads="N_mp",
+    ),
+    "int_field_border": xo.Kernel(
+        args=[
+            xo.Arg(xo.Int64, name="N_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="x_mp"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="y_mp"),
+            xo.Arg(xo.Float64, name="bias_x"),
+            xo.Arg(xo.Float64, name="bias_y"),
+            xo.Arg(xo.Float64, name="dx"),
+            xo.Arg(xo.Float64, name="dy"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="efx"),
+            xo.Arg(xo.Float64, pointer=True, const=True, name="efy"),
+            xo.Arg(xo.Int8, pointer=True, const=True, name="inside_mat"),
+            xo.Arg(xo.Int64, name="Nxg"),
+            xo.Arg(xo.Int64, name="Nyg"),
+            xo.Arg(xo.Float64, pointer=True, name="Ex_n"),
+            xo.Arg(xo.Float64, pointer=True, name="Ey_n"),
+        ],
+        n_threads="N_mp",
+    ),
 }
 
 qe=1.602176565e-19;
@@ -92,7 +125,7 @@ class PyPIC_Scatter_Gather(object):
 
         self.context = context
         if 'compute_sc_rho' not in context.kernels:
-            context.add_kernels(sources=[Path(__file__).parent / 'headers' / 'scatter_gather.h'], kernels=_kernels)
+            context.add_kernels(sources=['#include "PyPIC/headers/scatter_gather.h"'], kernels=_kernels)
         
         if xg is not None and yg is not None:
             assert(x_aper is None and y_aper is None and dx is None and dy is None)
