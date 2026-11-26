@@ -53,67 +53,32 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
         self.pic_external.scatter(x_mp, y_mp, nel_mp, charge, flag_add)
         self.pic_internal.scatter(x_mp, y_mp, nel_mp, charge, flag_add)
 
+    def _mask_internal(self, x_mp, y_mp):
+        return cp.logical_and(
+            cp.logical_and(x_mp > self.x_min_internal + self.D_discard,
+                           x_mp < self.x_max_internal - self.D_discard),
+            cp.logical_and(y_mp > self.y_min_internal + self.D_discard,
+                           y_mp < self.y_max_internal - self.D_discard))
+
+    # Both grids are evaluated at all particles (the interpolation returns zero
+    # outside a grid) and the result is selected per particle, which avoids
+    # splitting the particles with boolean indexing (a synchronization point).
     def gather(self, x_mp, y_mp):
-        mask_internal = cp.logical_and(\
-            cp.logical_and(x_mp > self.x_min_internal + self.D_discard, 
-                           x_mp < self.x_max_internal - self.D_discard),
-            cp.logical_and(y_mp > self.y_min_internal + self.D_discard, 
-                           y_mp < self.y_max_internal - self.D_discard))
-                           
-        idx_internal = cp.flatnonzero(mask_internal)
-        idx_external = cp.flatnonzero(~mask_internal)
+        mask_internal = self._mask_internal(x_mp, y_mp)
+        Ex_sc_n_external, Ey_sc_n_external = self.pic_external.gather(x_mp, y_mp)
+        Ex_sc_n_internal, Ey_sc_n_internal = self.pic_internal.gather(x_mp, y_mp)
+        return (cp.where(mask_internal, Ex_sc_n_internal, Ex_sc_n_external),
+                cp.where(mask_internal, Ey_sc_n_internal, Ey_sc_n_external))
 
-        Ex_sc_n_external, Ey_sc_n_external = self.pic_external.gather(x_mp[idx_external], y_mp[idx_external])
-        Ex_sc_n_internal, Ey_sc_n_internal = self.pic_internal.gather(x_mp[idx_internal], y_mp[idx_internal])
-        
-        Ex_sc_n = cp.empty_like(x_mp)
-        Ey_sc_n = cp.empty_like(x_mp)
-        
-        Ex_sc_n[idx_external] = Ex_sc_n_external
-        Ey_sc_n[idx_external] = Ey_sc_n_external
-        Ex_sc_n[idx_internal] = Ex_sc_n_internal
-        Ey_sc_n[idx_internal] = Ey_sc_n_internal
-        
-        return Ex_sc_n, Ey_sc_n
-        
     def gather_phi(self, x_mp, y_mp):
-        mask_internal = cp.logical_and(\
-            cp.logical_and(x_mp > self.x_min_internal + self.D_discard, 
-                           x_mp < self.x_max_internal - self.D_discard),
-            cp.logical_and(y_mp > self.y_min_internal + self.D_discard, 
-                           y_mp < self.y_max_internal - self.D_discard))
-                           
-        idx_internal = cp.flatnonzero(mask_internal)
-        idx_external = cp.flatnonzero(~mask_internal)
-
-        phi_sc_n_external = self.pic_external.gather_phi(x_mp[idx_external], y_mp[idx_external])
-        phi_sc_n_internal = self.pic_internal.gather_phi(x_mp[idx_internal], y_mp[idx_internal])
-        
-        phi_sc_n = cp.empty_like(x_mp)
-        
-        phi_sc_n[idx_external] = phi_sc_n_external
-        phi_sc_n[idx_internal] = phi_sc_n_internal
-
-        return phi_sc_n
+        mask_internal = self._mask_internal(x_mp, y_mp)
+        return cp.where(mask_internal, self.pic_internal.gather_phi(x_mp, y_mp),
+                        self.pic_external.gather_phi(x_mp, y_mp))
 
     def gather_rho(self, x_mp, y_mp):
-        mask_internal = cp.logical_and(\
-            cp.logical_and(x_mp > self.x_min_internal + self.D_discard, 
-                           x_mp < self.x_max_internal - self.D_discard),
-            cp.logical_and(y_mp > self.y_min_internal + self.D_discard, 
-                           y_mp < self.y_max_internal - self.D_discard))
-                           
-        idx_internal = cp.flatnonzero(mask_internal)
-        idx_external = cp.flatnonzero(~mask_internal)
-        rho_sc_n_external = self.pic_external.gather_rho(x_mp[idx_external], y_mp[idx_external])
-        rho_sc_n_internal = self.pic_internal.gather_rho(x_mp[idx_internal], y_mp[idx_internal])
-        
-        rho_sc_n = cp.zeros_like(x_mp)
-        
-        rho_sc_n[idx_external] = rho_sc_n_external
-        rho_sc_n[idx_internal] = rho_sc_n_internal
-
-        return rho_sc_n
+        mask_internal = self._mask_internal(x_mp, y_mp)
+        return cp.where(mask_internal, self.pic_internal.gather_rho(x_mp, y_mp),
+                        self.pic_external.gather_rho(x_mp, y_mp))
 
     def solve(self, rho = None, flag_verbose = False):
         if rho is not None:

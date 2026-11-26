@@ -657,8 +657,9 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.U_sc_eV_stp=0.;
 
 
-            self.Msel = csc_matrix(Msel)
-            self.Msel_T = csc_matrix(Msel.T)
+            self.idx_sel = cp.asarray(Msel.indices)  # Msel selects one node per column
+            # Boundary condition as precomputed factor, avoiding boolean indexing at each solve
+            self.not_force_zero_factor = cp.asarray(~flag_force_zero, dtype=float)
 
             #initialize self.luobj
             self.build_sparse_solver()
@@ -788,11 +789,9 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
     @profile
     def _solve_core(self, state, rho):
 
-        b=-rho.flatten()/eps0;
-        b[(self.flag_force_zero)]=0;
-        b_sel = self.Msel_T@b
-        phi_sel = self.luobj.solve(b_sel)
-        phi = self.Msel@phi_sel
+        b = -rho.flatten() / eps0 * self.not_force_zero_factor
+        phi = cp.zeros(b.size)
+        phi[self.idx_sel] = self.luobj.solve(b[self.idx_sel])
 
         efx = self.Dx@phi
         efy = self.Dy@phi

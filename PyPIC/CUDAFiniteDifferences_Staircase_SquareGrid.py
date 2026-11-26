@@ -406,12 +406,16 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             self.flag_border_mat = cp.array(flag_border_mat)
             self.Asel = Asel
             self.U_sc_eV_stp=0.;
-            self.Msel = csc_matrix(Msel)
-            self.Msel_T = csc_matrix(Msel.T)
+            self.idx_sel = cp.asarray(Msel.indices)  # Msel selects one node per column
             self.build_sparse_solver()
             self.x_border = cp.array(xn[flag_border_n])
             self.y_border = cp.array(yn[flag_border_n])
             self.flag_border_n = cp.array(flag_border_n)
+            # Boundary conditions as precomputed factors/indices, avoiding
+            # boolean indexing (a synchronization point) at each solve
+            self.inside_factor_n = cp.asarray(~flag_outside_n, dtype=float)
+            self.idx_border_n = cp.asarray(np.flatnonzero(flag_border_n))
+            self.border_factor_mat = cp.asarray(np.where(flag_border_mat, 2., 1.))
             
             print('Done PIC init.')
             
@@ -531,16 +535,13 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
     @profile            
     def _solve_core(self, state, rho, pic_external):
 
-        b=-rho.flatten()/eps0;
-        b[(self.flag_outside_n)]=0.; #boundary condition
+        b = -rho.flatten() / eps0 * self.inside_factor_n  # boundary condition
 
         if pic_external is not None:
-            phi_border = pic_external.gather_phi(self.x_border, self.y_border)
-            b[self.flag_border_n] = phi_border
+            b[self.idx_border_n] = pic_external.gather_phi(self.x_border, self.y_border)
 
-        b_sel = self.Msel_T@b
-        phi_sel = self.luobj.solve(b_sel)
-        phi = self.Msel@phi_sel
+        phi = cp.zeros(b.size)
+        phi[self.idx_sel] = self.luobj.solve(b[self.idx_sel])
         phi=cp.reshape(phi,(self.Nxg,self.Nyg))
 
         efx = state.efx
@@ -549,8 +550,8 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         efx[1:self.Nxg-1,:] = phi[0:self.Nxg-2,:] - phi[2:self.Nxg,:];  #central difference on internal nodes
         efy[:,1:self.Nyg-1] = phi[:,0:self.Nyg-2] - phi[:,2:self.Nyg];  #central difference on internal nodes
 
-        efx[self.flag_border_mat]=efx[self.flag_border_mat]*2;
-        efy[self.flag_border_mat]=efy[self.flag_border_mat]*2;
+        efx *= self.border_factor_mat
+        efy *= self.border_factor_mat
 
         state.efx = efx / (2*self.Dhcp);    #divide grid size
         state.efy = efy / (2*self.Dhcp);
