@@ -337,12 +337,7 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         yn=yn.flatten()
         #% xn and yn are stored such that the external index is on x 
 
-        if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
-            xn_gpu = cp.asarray(xn)
-            yn_gpu = cp.asarray(yn)
-            flag_outside_n = cp.asnumpy(chamb.is_outside(xn_gpu, yn_gpu))
-        else:
-            flag_outside_n=chamb.is_outside(xn,yn)
+        flag_outside_n=chamb.is_outside(xn,yn)
         flag_inside_n=~(flag_outside_n)
 
 

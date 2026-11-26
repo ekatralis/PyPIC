@@ -497,12 +497,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         yn=yn.T
         yn=yn.flatten()
         #% xn and yn are stored such that the external index is on x 
-        if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
-            xn_gpu = cp.asarray(xn)
-            yn_gpu = cp.asarray(yn)
-            flag_outside_n = cp.asnumpy(chamb.is_outside(xn_gpu, yn_gpu))
-        else:
-            flag_outside_n=chamb.is_outside(xn,yn)
+        flag_outside_n=chamb.is_outside(xn,yn)
         flag_inside_n=~(flag_outside_n)
 
         flag_outside_n_mat=np.reshape(flag_outside_n,(Nyg,Nxg),'F');
@@ -520,10 +515,6 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             list_internal_force_zero = []
             # Build A Dx Dy matrices 
-            if hasattr(chamb, 'use_gpu') and chamb.use_gpu:
-                impact_point_and_normal_kwargs = dict(resc_fac=.995, flag_robust=False, force_cpu=True)
-            else:
-                impact_point_and_normal_kwargs = dict(resc_fac=.995, flag_robust=False)
             for u in tqdm(range(0,Nxg*Nyg), desc="Mat Assembly"):
                 if flag_inside_n[u]:
 
@@ -531,26 +522,26 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
                     if flag_inside_n[u-1]: #phi(i-1,j)
                         hw = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-1]), na(yn[u-1]), na(0.), **impact_point_and_normal_kwargs)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-1]), na(yn[u-1]), na(0.), resc_fac=.995, flag_robust=False)
                         hw = np.abs(y_int[0]-yn[u])
 
                     if flag_inside_n[u+1]: #phi(i+1,j)
                         he = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+1]), na(yn[u+1]), na(0.), **impact_point_and_normal_kwargs)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+1]), na(yn[u+1]), na(0.), resc_fac=.995, flag_robust=False)
                         he = np.abs(y_int[0]-yn[u])
 
                     if flag_inside_n[u-Nyg]: #phi(i,j-1)
                         hs = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-Nyg]), na(yn[u-Nyg]), na(0.), **impact_point_and_normal_kwargs)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u-Nyg]), na(yn[u-Nyg]), na(0.), resc_fac=.995, flag_robust=False)
                         hs = np.abs(x_int[0]-xn[u])
                         #~ print hs
 
                     if flag_inside_n[u+Nyg]: #phi(i,j+1)
                         hn = Dh
                     else:
-                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+Nyg]), na(yn[u+Nyg]), na(0.), **impact_point_and_normal_kwargs)
+                        x_int,y_int,z_int,Nx_int,Ny_int, i_found_int = chamb.impact_point_and_normal(na(xn[u]), na(yn[u]), na(0.), na(xn[u+Nyg]), na(yn[u+Nyg]), na(0.), resc_fac=.995, flag_robust=False)
                         hn = np.abs(x_int[0]-xn[u])
                         #~ print hn
 
