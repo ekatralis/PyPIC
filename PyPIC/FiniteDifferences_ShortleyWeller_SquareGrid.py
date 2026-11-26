@@ -57,7 +57,6 @@ import scipy.sparse.linalg as ssl
 from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 
-from . import int_field_for_border as iffb
 
 
 na = lambda x:np.array([x])
@@ -248,7 +247,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.tol_stem = None
             self.tol_der = None
 
-        self.flag_inside_n_mat = np.logical_not(flag_outside_n_mat)
+        self.flag_inside_n_mat = np.logical_not(flag_outside_n_mat).astype(np.int8)
         self.chamb = chamb
         self.rho = np.zeros((self.Nxg,self.Nyg));
         self.phi = np.zeros((self.Nxg,self.Nyg));
@@ -268,16 +267,7 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         if not (len(x_mp)==len(y_mp)):
             raise ValueError('x_mp, y_mp should have the same length!!!')
 
-        if len(x_mp)>0:
-            ## compute beam electric field
-            Ex_sc_n, Ey_sc_n = iffb.int_field_border(x_mp,y_mp,self.bias_x,self.bias_y,self.Dh,
-                                         self.Dh, self.efx, self.efy, self.flag_inside_n_mat)
-
-        else:
-            Ex_sc_n=0.
-            Ey_sc_n=0.
-
-        return Ex_sc_n, Ey_sc_n
+        return self._int_field(x_mp, y_mp, self.efx, self.efy, self.flag_inside_n_mat)
 
     def build_sparse_solver(self):
 

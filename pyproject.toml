@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Collection of Python Particle-In-Cell solvers"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26", "scipy"]
+dependencies = ["numpy>=1.26", "scipy", "xobjects"]
 
 [project.urls]
 "Source Code" = "https://github.com/PyCOMPLETE/PyPIC"
@@ -21,6 +21,9 @@ fftw = ["pyfftw"]
 [tool.setuptools]
 include-package-data = false
 py-modules = []
+
+[tool.setuptools.package-data]
+PyPIC = ["headers/*.h"]
 
 [tool.setuptools.packages.find]
 include = ["PyPIC*"]

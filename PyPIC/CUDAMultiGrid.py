@@ -13,12 +13,14 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
                 sparse_solver = 'cuDSS', include_solver = True):
         
 
+        self.context = pic_external.context
         #build boundary for refinement grid
         box_internal = spoly.SimplePolygon({'Vx':np.array([x_max_internal, x_min_internal, x_min_internal, x_max_internal]),
                                 'Vy':np.array([y_max_internal, y_max_internal, y_min_internal, y_min_internal])})
         if include_solver:
             self.pic_internal = PIC_FD.FiniteDifferences_Staircase_SquareGrid(chamb = box_internal, Dh = Dh_internal, 
-                                    remove_external_nodes_from_mat=False, sparse_solver=sparse_solver, include_solver = True)
+                                    remove_external_nodes_from_mat=False, sparse_solver=sparse_solver, include_solver = True,
+                                    context=self.context)
             #check if the internal grid lies inside the chamber
             x_border = self.pic_internal.xn[self.pic_internal.flag_border_n.get()]
             y_border = self.pic_internal.yn[self.pic_internal.flag_border_n.get()]
@@ -29,7 +31,8 @@ class AddInternalGrid(PyPIC_Scatter_Gather):
 
         else:
             self.pic_internal = PIC_FD.FiniteDifferences_Staircase_SquareGrid(chamb = box_internal, Dh = Dh_internal, 
-                                    remove_external_nodes_from_mat=False, sparse_solver=sparse_solver, include_solver = False)
+                                    remove_external_nodes_from_mat=False, sparse_solver=sparse_solver, include_solver = False,
+                                    context=self.context)
                                     
                                     
         self.sparse_solver = sparse_solver

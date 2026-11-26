@@ -50,12 +50,34 @@
 #     all references.                                                  
 #----------------------------------------------------------------------
 
+from pathlib import Path
 import numpy as np
-from . import rhocompute as rhocom
-from . import int_field_for as iff
+import xobjects as xo
 #~ from abc import abstractmethod, ABCMeta
 
 na = lambda x:np.array([x])
+
+_grid_args = [xo.Arg(xo.Float64, name=name) for name in ('bias_x', 'bias_y', 'dx', 'dy')]
+_particle_args = [xo.Arg(xo.Int64, name='N_mp'),
+                  xo.Arg(xo.Float64, pointer=True, const=True, name='x_mp'),
+                  xo.Arg(xo.Float64, pointer=True, const=True, name='y_mp')]
+_grid_size_args = [xo.Arg(xo.Int64, name='Nxg'), xo.Arg(xo.Int64, name='Nyg')]
+_field_out_args = [xo.Arg(xo.Float64, pointer=True, name='Ex_n'), xo.Arg(xo.Float64, pointer=True, name='Ey_n')]
+_field_in_args = [xo.Arg(xo.Float64, pointer=True, const=True, name='efx'),
+                  xo.Arg(xo.Float64, pointer=True, const=True, name='efy')]
+_kernels = {
+    'compute_sc_rho': xo.Kernel(
+        args=_particle_args + [xo.Arg(xo.Float64, pointer=True, const=True, name='nel_mp')]
+        + _grid_args + _grid_size_args + [xo.Arg(xo.Float64, pointer=True, name='rho')],
+        n_threads='N_mp'),
+    'int_field': xo.Kernel(
+        args=_particle_args + _grid_args + _field_in_args + _grid_size_args + _field_out_args,
+        n_threads='N_mp'),
+    'int_field_border': xo.Kernel(
+        args=_particle_args + _grid_args + _field_in_args
+        + [xo.Arg(xo.Int8, pointer=True, const=True, name='inside_mat')] + _grid_size_args + _field_out_args,
+        n_threads='N_mp'),
+}
 
 qe=1.602176565e-19;
 eps0=8.8541878176e-12;
@@ -64,9 +86,13 @@ class PyPIC_Scatter_Gather(object):
     #__metadata__ = ABCMeta
 
     def __init__(self, x_aper=None, y_aper=None, dx=None, dy=None, xg=None, yg=None, 
-                x_min=None, x_max=None, y_min=None, y_max=None, *args, **kwargs):
+                x_min=None, x_max=None, y_min=None, y_max=None, *args, context=xo.context_default, **kwargs):
 
         print('PyPIC Version 2.4.5')
+
+        self.context = context
+        if 'compute_sc_rho' not in context.kernels:
+            context.add_kernels(sources=[Path(__file__).parent / 'headers' / 'scatter_gather.h'], kernels=_kernels)
         
         if xg is not None and yg is not None:
             assert(x_aper is None and y_aper is None and dx is None and dy is None)
@@ -138,10 +164,11 @@ class PyPIC_Scatter_Gather(object):
         if not (len(x_mp)==len(y_mp)==len(nel_mp)):
             raise ValueError('x_mp, y_mp, nel_mp should have the same length!!!')
         
+        rho = self.context.zeros((self.Nxg, self.Nyg))
         if len(x_mp)>0:
-            rho=rhocom.compute_sc_rho(x_mp,y_mp,nel_mp,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg)
-        else:
-            rho=self.rho*0.
+            self.context.kernels.compute_sc_rho(N_mp=len(x_mp), x_mp=x_mp, y_mp=y_mp, nel_mp=nel_mp,
+                                                bias_x=self.bias_x, bias_y=self.bias_y, dx=self.dx, dy=self.dy,
+                                                Nxg=self.Nxg, Nyg=self.Nyg, rho=rho)
 
         if flag_add:
             self.rho+=charge*rho/(self.dx*self.dy);
@@ -154,46 +181,37 @@ class PyPIC_Scatter_Gather(object):
         if not (len(x_mp)==len(y_mp)):
             raise ValueError('x_mp, y_mp should have the same length!!!')
 
-        if len(x_mp)>0:    
-            ## compute beam electric field
-            Ex_sc_n, Ey_sc_n = iff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                                         self.dy, self.efx, self.efy)
-                       
-        else:
-            Ex_sc_n=0.
-            Ey_sc_n=0.
-            
-        return Ex_sc_n, Ey_sc_n
+        return self._int_field(x_mp, y_mp, self.efx, self.efy)
         
     def gather_phi(self, x_mp, y_mp):
         
         if not (len(x_mp)==len(y_mp)):
             raise ValueError('x_mp, y_mp should have the same length!!!')
 
-        if len(x_mp)>0:    
-            ## compute beam potential
-            phi_sc_n, _ = iff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                                         self.dy, self.phi, self.phi)
-                       
-        else:
-            phi_sc_n=0.
-            
-        return phi_sc_n
+        return self._int_field(x_mp, y_mp, self.phi, self.phi)[0]
         
     def gather_rho(self, x_mp, y_mp):
         
         if not (len(x_mp)==len(y_mp)):
             raise ValueError('x_mp, y_mp should have the same length!!!')
 
-        if len(x_mp)>0:    
-            ## compute beam distribution
-            rho_sc_n, _ = iff.int_field(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                                         self.dy, self.rho, self.rho)
-                       
+        return self._int_field(x_mp, y_mp, self.rho, self.rho)[0]
+
+    def _int_field(self, x_mp, y_mp, efx, efy, inside_mat=None):
+        # Bilinear interpolation of grid quantities at the particle positions,
+        # restricted to the nodes inside the chamber when inside_mat is given
+        if len(x_mp)==0:
+            return 0., 0.
+        xp = self.context.nplike_lib
+        Ex_n, Ey_n = self.context.zeros(len(x_mp)), self.context.zeros(len(x_mp))
+        kwargs = dict(N_mp=len(x_mp), x_mp=x_mp, y_mp=y_mp, bias_x=self.bias_x, bias_y=self.bias_y,
+                      dx=self.dx, dy=self.dy, efx=xp.ascontiguousarray(efx), efy=xp.ascontiguousarray(efy),
+                      Nxg=self.Nxg, Nyg=self.Nyg, Ex_n=Ex_n, Ey_n=Ey_n)
+        if inside_mat is None:
+            self.context.kernels.int_field(**kwargs)
         else:
-            rho_sc_n=0.
-            
-        return rho_sc_n
+            self.context.kernels.int_field_border(inside_mat=inside_mat, **kwargs)
+        return Ex_n, Ey_n
 
     #@abstractmethod
     def solve(self, *args, **kwargs):

@@ -37,14 +37,12 @@ def test_scatter_conserves_charge_and_gather_reproduces_linear_field():
 
 
 def test_border_interpolation_renormalizes_weights():
-    from PyPIC import int_field_for_border as module
-    inside = np.ones((4, 4), dtype=np.int32)
+    pic = PyPIC_Scatter_Gather(xg=np.arange(4.), yg=np.arange(4.))
+    inside = np.ones((4, 4), dtype=np.int8)
     inside[0, 0] = 0
     field = np.full((4, 4), 7.)
     field[0, 0] = 1000.  # The outside node must make no contribution.
-    ex, ey = module.int_field_border(
-        np.array([0.25]), np.array([0.25]), 0., 0., 1., 1.,
-        field, -field, inside)
+    ex, ey = pic._int_field(np.array([0.25]), np.array([0.25]), field, -field, inside)
     assert_allclose(ex, 7.)
     assert_allclose(ey, -7.)
 

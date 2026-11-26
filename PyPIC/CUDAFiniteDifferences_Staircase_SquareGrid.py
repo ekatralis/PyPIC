@@ -74,256 +74,23 @@ na = lambda x:np.array([x])
 qe = cp.array(e)
 eps0 = cp.array(epsilon_0)
 
-cuda_src = r'''
-extern "C" __global__
-void int_field(const long N_mp,
-               const double* __restrict__ xn,
-               const double* __restrict__ yn,
-               const double bias_x,
-               const double bias_y,
-               const double dx,
-               const double dy,
-               const double* __restrict__ efx,
-               const double* __restrict__ efy,
-               const int Nxg,
-               const int Nyg,
-               const long stride_i,
-               const long stride_j,
-               double* __restrict__ Ex_n,
-               double* __restrict__ Ey_n)
-{
-    long p = blockDim.x * blockIdx.x + threadIdx.x;
-    if (p >= N_mp) return;
-
-    double fi = 1.0 + (xn[p] - bias_x) / dx;
-    double fj = 1.0 + (yn[p] - bias_y) / dy;
-
-    // Match Fortran INT(): truncate toward zero
-    int i = (int)fi;
-    int j = (int)fj;
-
-    double hx = fi - (double)i;
-    double hy = fj - (double)j;
-
-    double Ex = 0.0, Ey = 0.0;
-    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
-        int i0 = i - 1, j0 = j - 1;
-
-        long idx00 = (long)i0 * stride_i + (long)j0 * stride_j;
-        long idx10 = (long)(i0+1) * stride_i + (long)j0 * stride_j;
-        long idx01 = (long)i0 * stride_i + (long)(j0+1) * stride_j;
-        long idx11 = (long)(i0+1) * stride_i + (long)(j0+1) * stride_j;
-
-        double w00 = (1.0 - hx) * (1.0 - hy);
-        double w10 = hx * (1.0 - hy);
-        double w01 = (1.0 - hx) * hy;
-        double w11 = hx * hy;
-
-        Ex = efx[idx00]*w00 + efx[idx10]*w10 + efx[idx01]*w01 + efx[idx11]*w11;
-        Ey = efy[idx00]*w00 + efy[idx10]*w10 + efy[idx01]*w01 + efy[idx11]*w11;
-    }
-    Ex_n[p] = Ex;
-    Ey_n[p] = Ey;
-}
-''';
-
-mod = cp.RawModule(
-    code=cuda_src,
-    options=('--std=c++11', '--use_fast_math'),
-    backend='nvrtc')
-int_field_kernel = mod.get_function('int_field')
-
-def _strides_in_elements(arr2d):
-    return (arr2d.strides[0] // arr2d.itemsize,
-            arr2d.strides[1] // arr2d.itemsize)
-
-@profile
-def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=None, stream=None):
-    """
-    CuPy wrapper for the int_field kernel.
-
-    Parameters
-    ----------
-    xn, yn : (N_mp,) cupy.ndarray, float64
-    bias_x, bias_y, dx, dy : float (or float64)
-    efx, efy : (Nxg, Nyg) cupy.ndarray, float64      # matches Fortran shapes
-    Ex_n, Ey_n : optional output buffers (float64); if None they are allocated
-    stream : cp.cuda.Stream or None
-
-    Returns
-    -------
-    Ex_n, Ey_n : (N_mp,) cupy.ndarray, float64
-    """
-    # Type/shape checks (lightweight)
-    # assert xn.dtype == yn.dtype == cp.float64
-    # assert efx.dtype == efy.dtype == cp.float64
-    # assert efx.shape == efy.shape and efx.ndim == 2
-
-    Nxg, Nyg = map(int, efx.shape)  # shape is (Nxg, Nyg) to mirror Fortran
-    N_mp = int(xn.size)
-
-    if Ex_n is None:
-        Ex_n, Ey_n = cp.empty_like(xn), cp.empty_like(xn)
-
-    stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
-
-    threads = 512
-    blocks = (N_mp + threads - 1) // threads
-
-    args = (
-        N_mp,
-        xn, yn,
-        float(bias_x), float(bias_y),
-        float(dx), float(dy),
-        efx, efy,
-        cp.int32(Nxg), cp.int32(Nyg),
-        cp.int64(stride_i), cp.int64(stride_j),
-        Ex_n, Ey_n
-    )
-
-    if stream is None:
-        int_field_kernel((blocks,), (threads,), args)
-    else:
-        with stream:
-            int_field_kernel((blocks,), (threads,), args)
-
-    return Ex_n, Ey_n
-
-kernel_code_f = r'''
-extern "C" {
-
-#if __CUDA_ARCH__ < 600 && defined(__CUDA_ARCH__)
-__device__ double atomicAdd_double(double* address, double val) {
-    unsigned long long int* address_as_ull = (unsigned long long int*)address;
-    unsigned long long int old = *address_as_ull, assumed;
-    do {
-        assumed = old;
-        old = atomicCAS(address_as_ull, assumed,
-                        __double_as_longlong(val + __longlong_as_double(assumed)));
-    } while (assumed != old);
-    return __longlong_as_double(old);
-}
-#define ATOMIC_ADD(addr, v) atomicAdd_double((addr), (v))
-#else
-#define ATOMIC_ADD(addr, v) atomicAdd((addr), (v))
-#endif
-
-// Drop-in: matches Fortran INT/1-based logic and (i,j) indexing
-__global__ void compute_sc_rho_kernel_f(
-    const long long N_mp,
-    const double* __restrict__ x_mp,
-    const double* __restrict__ y_mp,
-    const double* __restrict__ nel_mp,
-    const double bias_x, const double bias_y,
-    const double dx, const double dy,
-    const int Nxg, const int Nyg,
-    double* __restrict__ rho,
-    const long long sx,  // stride (elements) for dim-0 (i)
-    const long long sy   // stride (elements) for dim-1 (j)
-){
-    long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (p >= N_mp) return;
-
-    double x = x_mp[p];
-    double y = y_mp[p];
-    double w = nel_mp[p];
-
-    if (!isfinite(x) || !isfinite(y) || !isfinite(w)) return;
-    if (!(dx > 0.0) || !(dy > 0.0)) return;
-
-    // Fortran-style: 1-based indices via INT (truncate toward zero)
-    double fi = 1.0 + (x - bias_x) / dx;
-    int i = (int)(fi);         // INT in Fortran (trunc toward zero)
-    double hx = fi - (double)i;
-
-    double fj = 1.0 + (y - bias_y) / dy;
-    int j = (int)(fj);
-    double hy = fj - (double)j;
-
-    // Fortran guard: if (i>0 .and. j>0 .and. i<Nxg .and. j<Nyg)
-    if (i > 0 && j > 0 && i < Nxg && j < Nyg) {
-        // Convert to 0-based offsets
-        long long i0 = (long long)(i - 1);
-        long long j0 = (long long)(j - 1);
-
-        long long idx00 = i0 * sx + j0 * sy;
-
-        double w00 = w * (1.0 - hx) * (1.0 - hy);
-        double w10 = w * (      hx) * (1.0 - hy);
-        double w01 = w * (1.0 - hx) * (      hy);
-        double w11 = w * (      hx) * (      hy);
-
-        ATOMIC_ADD(&rho[idx00             ], w00);
-        ATOMIC_ADD(&rho[idx00 + sx        ], w10);
-        ATOMIC_ADD(&rho[idx00 + sy        ], w01);
-        ATOMIC_ADD(&rho[idx00 + sx + sy   ], w11);
-    }
-}
-} // extern "C"
-'''
-mod = cp.RawModule(
-    code=kernel_code_f,
-    options=('--std=c++14', '--use_fast_math'),
-    backend='nvrtc')
-compute_sc_rho_kernel_f = mod.get_function('compute_sc_rho_kernel_f')
-
-@profile
-def compute_rho_gpu_dropin(
-    x_mp, y_mp, nel_mp,
-    bias_x, bias_y, dx, dy,
-    Nxg, Nyg,
-    rho=None
-):
-    # Device arrays, float64
-    # x_mp = cp.asarray(x_mp, dtype=cp.float64)
-    # y_mp = cp.asarray(y_mp, dtype=cp.float64)
-    # nel_mp = cp.asarray(nel_mp, dtype=cp.float64)
-
-    # rho shaped (Nxg, Nyg) like Fortran; default Fortran-order
-    # if rho is None:
-    #     rho = cp.zeros((Nxg, Nyg), dtype=cp.float64, order='F')
-    # else:
-    #     assert isinstance(rho, cp.ndarray)
-    #     assert rho.dtype == cp.float64
-    #     assert rho.shape == (Nxg, Nyg)
-    #     rho.fill(0.0)
-
-    # Strides in ELEMENTS (not bytes)
-    sx = rho.strides[0] // rho.itemsize
-    sy = rho.strides[1] // rho.itemsize
-
-    N_mp = int(x_mp.size)
-    threads = 512
-    blocks = (N_mp + threads - 1) // threads
-
-    compute_sc_rho_kernel_f(
-        (blocks,), (threads,),
-        (
-            cp.int64(N_mp),
-            x_mp, y_mp, nel_mp,
-            float(bias_x), float(bias_y),
-            float(dx), float(dy),
-            cp.int32(Nxg), cp.int32(Nyg),
-            rho,
-            cp.int64(sx), cp.int64(sy)
-        )
-    )
-    # return rho
-
 class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
     #@profile
-    def __init__(self, chamb, Dh, sparse_solver = 'cupy_splu', remove_external_nodes_from_mat=True, include_solver = True):
+    def __init__(self, chamb, Dh, sparse_solver = 'cupy_splu', remove_external_nodes_from_mat=True, include_solver = True,
+                 context=None):
         
         print('Start PIC init.:')
         print('Finite Differences, Square Grid')
 
 
         self.Dh = Dh
+        context = context or xo.ContextCupy()
         if hasattr(chamb, 'x_min') and hasattr(chamb, 'x_max') and hasattr(chamb, 'y_min') and hasattr(chamb, 'y_max'):
             super(FiniteDifferences_Staircase_SquareGrid, self).__init__(dx = self.Dh, dy = self.Dh, 
-                x_min = chamb.x_min, x_max = chamb.x_max, y_min = chamb.y_min, y_max = chamb.y_max)
+                x_min = chamb.x_min, x_max = chamb.x_max, y_min = chamb.y_min, y_max = chamb.y_max, context=context)
         else:
-            super(FiniteDifferences_Staircase_SquareGrid, self).__init__(chamb.x_aper, chamb.y_aper, self.Dh, self.Dh)
+            super(FiniteDifferences_Staircase_SquareGrid, self).__init__(chamb.x_aper, chamb.y_aper, self.Dh, self.Dh,
+                                                                         context=context)
 
         Nyg, Nxg = self.Nyg, self.Nxg
         
@@ -416,7 +183,6 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         else:
             self.solve = self._solve_for_states          
         # print(self.Asel.shape)
-        self.unitarea = cp.array(self.dx*self.dy)
         self.Dhcp = cp.array(Dh)
         self.rho = cp.zeros((self.Nxg,self.Nyg));
         self.phi = cp.zeros((self.Nxg,self.Nyg));
@@ -439,59 +205,9 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
             
         self._solve_core(self, rho, pic_external) #change 2
 
-    def gather(self, x_mp, y_mp):
-        
-        if not (len(x_mp)==len(y_mp)):
-            raise ValueError('x_mp, y_mp should have the same length!!!')
-
-        if len(x_mp)>0:    
-            ## compute beam electric field
-            Ex_sc_n = cp.zeros_like(x_mp)
-            Ey_sc_n = cp.zeros_like(x_mp)
-            
-            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                         self.dy, self.efx, self.efy, Ex_n=Ex_sc_n, Ey_n=Ey_sc_n)
-        else:
-            Ex_sc_n=cp.array(0.)
-            Ey_sc_n=cp.array(0.)
-            
-        return Ex_sc_n, Ey_sc_n
-
-    def gather_phi(self, x_mp, y_mp):
-        
-        if not (len(x_mp)==len(y_mp)):
-            raise ValueError('x_mp, y_mp should have the same length!!!')
-
-        if len(x_mp)>0:    
-            ## compute beam potential
-            phi_sc_n = cp.zeros_like(x_mp)
-            phi_sc_n2 = cp.zeros_like(x_mp)
-            int_field_cu(x_mp,y_mp,self.bias_x,self.bias_y,self.dx,
-                         self.dy, self.phi, self.phi, Ex_n=phi_sc_n, Ey_n=phi_sc_n2)
-                       
-        else:
-            phi_sc_n=cp.array(0.)
-            
-        return phi_sc_n
-    
-    def scatter(self, x_mp, y_mp, nel_mp, charge = -qe, flag_add=False):
-        
-        if not (len(x_mp)==len(y_mp)==len(nel_mp)):
-            raise ValueError('x_mp, y_mp, nel_mp should have the same length!!!')
-        
-        if len(x_mp)>0:
-            rho = cp.zeros((self.Nxg, self.Nyg), dtype=cp.float64)
-            compute_rho_gpu_dropin(x_mp,y_mp,nel_mp,self.bias_x,self.bias_y,self.dx,self.dy,self.Nxg,self.Nyg, rho=rho)
-        else:
-            rho=self.rho*0.
-
-        if flag_add:
-            self.rho+=charge*rho/self.unitarea;
-        else:
-            self.rho=charge*rho/self.unitarea;
-        
     def get_state_object(self):
-        state = FiniteDifferences_Staircase_SquareGrid(chamb=self.chamb, Dh=self.Dh, include_solver=False)
+        state = FiniteDifferences_Staircase_SquareGrid(chamb=self.chamb, Dh=self.Dh, include_solver=False,
+                                                       context=self.context)
         
         state.rho = self.rho.copy()
         state.phi = self.phi.copy()

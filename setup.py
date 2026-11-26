@@ -41,9 +41,6 @@ class F2PyBuildExt(build_ext):
 extensions = [
     Extension('PyPIC.' + name, ['PyPIC/fortran/' + source])
     for name, source in [
-        ('rhocompute', 'compute_rho.f'),
-        ('int_field_for', 'interp_field_for.f'),
-        ('int_field_for_border', 'interp_field_for_with_border.f'),
         ('errffor', 'errfff.f'),
     ]
 ]

@@ -1,5 +1,5 @@
 include README.md Makefile release.sh
-recursive-include PyPIC *.py *.f
+recursive-include PyPIC *.py *.f *.h
 recursive-include tests *.py
 recursive-include examples *.py *.md
 global-exclude *.so *.pyd *.pyc
