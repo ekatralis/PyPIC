@@ -147,6 +147,7 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
     xn, yn : (N_mp,) cupy.ndarray, float64
     bias_x, bias_y, dx, dy : float (or float64)
     efx, efy : (Nxg, Nyg) cupy.ndarray, float64      # matches Fortran shapes
+    Ex_n, Ey_n : optional output buffers (float64); if None they are allocated
     stream : cp.cuda.Stream or None
 
     Returns
@@ -161,8 +162,8 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
     Nxg, Nyg = map(int, efx.shape)  # shape is (Nxg, Nyg) to mirror Fortran
     N_mp = int(xn.size)
 
-    # Ex_n = cp.zeros_like(xn)
-    # Ey_n = cp.zeros_like(xn)
+    if Ex_n is None:
+        Ex_n, Ey_n = cp.empty_like(xn), cp.empty_like(xn)
 
     stride_i, stride_j = _strides_in_elements(efx)  # supports C- or F-order
 
@@ -186,7 +187,7 @@ def int_field_cu(xn, yn, bias_x, bias_y, dx, dy, efx, efy, *, Ex_n=None, Ey_n=No
         with stream:
             int_field_kernel((blocks,), (threads,), args)
 
-    # return Ex_n, Ey_n
+    return Ex_n, Ey_n
 
 kernel_code_f = r'''
 extern "C" {
