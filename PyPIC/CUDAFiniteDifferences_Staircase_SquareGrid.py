@@ -58,10 +58,18 @@ from scipy.constants import e, epsilon_0
 import cupy as cp
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
 from cupyx.scipy.sparse.linalg import splu
-from line_profiler import profile
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
 from .luLU import luLU
 from .cuDSSLU import SpMDVSolver
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 na = lambda x:np.array([x])
 

@@ -61,8 +61,16 @@ from cupyx.scipy.sparse import csc_matrix, csr_matrix
 from cupyx.scipy.sparse.linalg import splu, spsolve
 from cupyx.scipy.linalg import lu_factor, lu_solve
 from cupyx.scipy.sparse.linalg import cg, gmres, LinearOperator
-from line_profiler import profile
-from tqdm import tqdm
+try:
+    from line_profiler import profile
+except ImportError:
+    def profile(func):
+        return func
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 from cupy import fuse
 from cupyx.time import repeat
 from .luLU import luLU
