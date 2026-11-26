@@ -57,14 +57,12 @@ from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 import cupy as cp
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
-from cupyx.scipy.sparse.linalg import splu
 try:
     from line_profiler import profile
 except ImportError:
     def profile(func):
         return func
-from .luLU import luLU
-from .cuDSSLU import SpMDVSolver
+import xobjects as xo
 try:
     from tqdm import tqdm
 except ImportError:
@@ -431,22 +429,13 @@ class FiniteDifferences_Staircase_SquareGrid(PyPIC_Scatter_Gather):
         self.chamb = chamb
         
     def build_sparse_solver(self):
+        xo_solvers = {'cupy_splu': 'cupySLU', 'luLU': 'CachedSLU', 'cuDSS': 'cuDSS'}
+        if self.sparse_solver not in xo_solvers:
+            raise ValueError('sparse_solver must be one of %s' % list(xo_solvers))
+        print("[Solver INIT]: Using %s solver" % self.sparse_solver)
+        self.luobj = xo.sparse.factorized_sparse_solver(
+            self.Asel.tocsr(), force_solver=xo_solvers[self.sparse_solver], context='cupy')
 
-        if self.sparse_solver == 'cupy_splu':
-            print("[Solver INIT]: Using CuPy splu solver")
-            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
-        elif self.sparse_solver == 'luLU':
-            print("[Solver INIT]: Using luLU solver")
-            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
-        elif self.sparse_solver == 'cuDSS':
-            print("[Solver INIT]: Using cuDSS solver")
-            luobj = SpMDVSolver(self.Asel.tocsr())
-        else:
-            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
-
-        self.luobj = luobj
-        
-    #@profile    
     def solve(self, rho = None, flag_verbose = False, pic_external = None):
 
         if rho is None:

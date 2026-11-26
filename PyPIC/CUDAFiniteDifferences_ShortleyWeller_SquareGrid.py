@@ -58,7 +58,6 @@ from .PyPIC_Scatter_Gather import PyPIC_Scatter_Gather
 from scipy.constants import e, epsilon_0
 import cupy as cp
 from cupyx.scipy.sparse import csc_matrix, csr_matrix
-from cupyx.scipy.sparse.linalg import splu, spsolve
 from cupyx.scipy.linalg import lu_factor, lu_solve
 from cupyx.scipy.sparse.linalg import cg, gmres, LinearOperator
 try:
@@ -73,12 +72,7 @@ except ImportError:
         return iterable
 from cupy import fuse
 from cupyx.time import repeat
-from .luLU import luLU
-try:
-    from .cuDSSLU import SpMDVSolver
-except ModuleNotFoundError:
-    import warnings
-    warnings.warn("nvmath package not found. cuDSS solver unavailable")
+import xobjects as xo
 from . import rhocompute as rhocom
 # from . import int_field_for_border as iffb
 
@@ -651,9 +645,6 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
 
             self.sparse_solver = sparse_solver
 
-            if self.sparse_solver == 'cupy_custom': 
-                self.A = csc_matrix(A)
-
             self.U_sc_eV_stp=0.;
 
 
@@ -746,25 +737,12 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
             self.rho=charge*rho/self.unitarea;
 
     def build_sparse_solver(self):
-
-        if self.sparse_solver == 'cupy_splu':
-            print("[Solver INIT]: Using CuPy splu solver")
-            luobj = splu(self.Asel, permc_spec="MMD_AT_PLUS_A") #,diag_pivot_thresh=1.0
-        elif self.sparse_solver == 'cupy_custom':
-            print("[Solver INIT]: Using CuPy no selection")
-            # luobj = None
-            luobj = splu(self.A, permc_spec="MMD_AT_PLUS_A")
-            self._solve_core = self._solve_core_iter
-        elif self.sparse_solver == 'luLU':
-            print("[Solver INIT]: Using luLU solver")
-            luobj = luLU(self.Asel, permc_spec="MMD_AT_PLUS_A")
-        elif self.sparse_solver == 'cuDSS':
-            print("[Solver INIT]: Using cuDSS solver")
-            luobj = SpMDVSolver(self.Asel.tocsr())
-        else:
-            raise ValueError('Solver not recognized!!!!\nsparse_solver must be "cupy_splu", "cuDSS" or "luLU"\n')
-
-        self.luobj = luobj
+        xo_solvers = {'cupy_splu': 'cupySLU', 'luLU': 'CachedSLU', 'cuDSS': 'cuDSS'}
+        if self.sparse_solver not in xo_solvers:
+            raise ValueError('sparse_solver must be one of %s' % list(xo_solvers))
+        print("[Solver INIT]: Using %s solver" % self.sparse_solver)
+        self.luobj = xo.sparse.factorized_sparse_solver(
+            self.Asel.tocsr(), force_solver=xo_solvers[self.sparse_solver], context='cupy')
 
     def get_state_object(self):
         state = FiniteDifferences_ShortleyWeller_SquareGrid(chamb=self.chamb, Dh=self.Dh,
@@ -801,20 +779,3 @@ class FiniteDifferences_ShortleyWeller_SquareGrid(PyPIC_Scatter_Gather):
         state.efx = efx
         state.efy = efy
         state.phi = phi
-    
-    @profile
-    def _solve_core_iter(self, state, rho):
-        
-        b=-rho.flatten()/eps0;
-        b[(self.flag_force_zero)]=0;
-        phi = self.luobj.solve(b)
-
-        efx = self.Dx@phi
-        efy = self.Dy@phi
-        phi=cp.reshape(phi,(self.Nxg,self.Nyg))
-        efx=cp.reshape(efx,(self.Nxg,self.Nyg))
-        efy=cp.reshape(efy,(self.Nxg,self.Nyg))
-        state.efx = efx
-        state.efy = efy
-        state.phi = phi
-
